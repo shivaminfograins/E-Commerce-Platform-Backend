@@ -15,8 +15,11 @@ from django.utils.encoding import (
 from django.utils.http import (
     urlsafe_base64_decode
 )
+from django.conf import settings
+from django.core.mail import send_mail
 
 
+from rest_framework_simplejwt.views import TokenObtainPairView
 from .models import Profile, Address, User
 from .serializers import (
     ForgotPasswordSerializer,
@@ -24,6 +27,7 @@ from .serializers import (
     ProfileSerializer,
     AddressSerializer,
     ResetPasswordSerializer,
+    CustomTokenObtainPairSerializer,
 )
 
 #-----------------------------------------------------------
@@ -260,9 +264,26 @@ class ForgotPasswordAPIView(APIView):
         )
 
         reset_link = (
-            f"http://localhost:3000/"
+            f"{settings.FRONTEND_URL.rstrip('/')}/"
             f"reset-password/"
             f"{uid}/{token}/"
+        )
+
+        # Send email with reset link
+        subject = "Password Reset Request"
+        message = (
+            f"Hello,\n\n"
+            f"You requested a password reset for your E-Commerce account.\n"
+            f"Please click the link below to reset your password:\n\n"
+            f"{reset_link}\n\n"
+            f"If you did not request this, please ignore this email.\n"
+        )
+        send_mail(
+            subject=subject,
+            message=message,
+            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "no-reply@ecommerce.com"),
+            recipient_list=[email],
+            fail_silently=False,
         )
 
         return Response(
@@ -341,4 +362,8 @@ class ResetPasswordAPIView(APIView):
                 "Password reset successful"
             }
         )
+
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
     

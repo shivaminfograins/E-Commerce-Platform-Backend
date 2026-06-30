@@ -16,7 +16,8 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import include, path
-from rest_framework_simplejwt.views import (TokenObtainPairView,TokenRefreshView)
+from rest_framework_simplejwt.views import TokenRefreshView
+from apps.accounts.views import CustomTokenObtainPairView
 from django.conf import settings
 from django.conf.urls.static import static
 
@@ -26,9 +27,10 @@ urlpatterns = [
     # apps urls
     path("api/auth/",include("apps.accounts.urls")),
     path("api/products/",include("apps.products.urls")),
+    path("api/wishlist/",include("apps.wishlist.urls")),
     
     # JWT Authentication urls
-    path("api/auth/login/",TokenObtainPairView.as_view(),name="token_obtain_pair",),
+    path("api/auth/login/",CustomTokenObtainPairView.as_view(),name="token_obtain_pair",),
     path("api/auth/token/refresh/",TokenRefreshView.as_view(), name="token_refresh",),
 ]
 

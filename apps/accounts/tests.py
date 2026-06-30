@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.urls import reverse
+from django.core import mail
 from rest_framework import status
 from rest_framework.test import APITestCase
 from apps.accounts.models import Address, Profile
@@ -173,14 +174,23 @@ class PasswordResetAPITests(APITestCase):
         self.reset_url = reverse("reset-password")
 
     def test_forgot_password_valid_email(self):
+        mail.outbox = []
         response = self.client.post(self.forgot_url, {"email": "resetuser@gmail.com"}, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("reset_link", response.data)
         self.assertEqual(response.data["message"], "Password reset link generated.")
+        
+        # Verify that an email was sent
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, "Password Reset Request")
+        self.assertIn(response.data["reset_link"], mail.outbox[0].body)
+        self.assertEqual(mail.outbox[0].to, ["resetuser@gmail.com"])
 
     def test_forgot_password_invalid_email(self):
+        mail.outbox = []
         response = self.client.post(self.forgot_url, {"email": "nonexistent@gmail.com"}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(len(mail.outbox), 0)
 
     def test_reset_password_success(self):
         # Generate token

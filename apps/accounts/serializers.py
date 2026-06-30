@@ -4,6 +4,7 @@ from .models import User, Profile, Address
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -110,3 +111,15 @@ class ResetPasswordSerializer(serializers.Serializer):
             )
 
         return attrs
+
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        data["user"] = {
+            "id": self.user.id,
+            "email": self.user.email,
+            "username": self.user.username,
+            "role": self.user.role,
+        }
+        return data
