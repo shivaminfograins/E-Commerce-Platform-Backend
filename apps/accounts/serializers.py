@@ -56,13 +56,49 @@ class ProfileSerializer(serializers.ModelSerializer):
         read_only_fields = ["user"] 
 
 
+# class AddressSerializer(serializers.ModelSerializer):
+    
+#     class Meta:
+#         model = Address
+#         fields = "__all__"
+#         read_only_fields = ["user"]
+
 class AddressSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Address
-        fields = "__all__"
-        read_only_fields = ["user"]
 
+        fields = "__all__"
+
+        read_only_fields = (
+            "id",
+            "user",
+            "created_at",
+            "updated_at",
+        )
+
+    def validate(self, attrs):
+        """
+        Ensure only one default address per user.
+        """
+
+        request = self.context.get("request")
+
+        if not request:
+            return attrs
+
+        if attrs.get("is_default", False):
+
+            Address.objects.filter(
+                user=request.user,
+                is_default=True,
+            ).exclude(
+                pk=self.instance.pk if self.instance else None
+            ).update(
+                is_default=False
+            )
+
+        return attrs
 
 #-----------------------------------------------------------
 # Password forget Serializers
@@ -116,6 +152,15 @@ class ResetPasswordSerializer(serializers.Serializer):
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
         data = super().validate(attrs)
+        
+        # Merge guest cart to user cart upon login
+        request = self.context.get("request")
+        if request:
+            guest_token = request.headers.get("X-Guest-ID") or request.COOKIES.get("guest_id")
+            if guest_token:
+                from apps.cart.views import merge_guest_cart
+                merge_guest_cart(self.user, guest_token)
+
         data["user"] = {
             "id": self.user.id,
             "email": self.user.email,

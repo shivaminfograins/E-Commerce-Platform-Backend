@@ -105,13 +105,33 @@ class ProfileAPIView(APIView):
 
         return Response(serializer.data)
     
-#----------------------------------------------------------
-# Address List Create API View
-# ----------------------------------------------------------
+from django.shortcuts import get_object_or_404
+
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import Address
+from .serializers import AddressSerializer
+
+
+# ==========================================================
+# Address List & Create API
+#
+# GET  -> List all addresses of logged-in user
+# POST -> Create a new address
+# ==========================================================
 class AddressListCreateAPIView(APIView):
-    
+
+    # Only authenticated users can access
     permission_classes = [IsAuthenticated]
 
+    # ------------------------------------------------------
+    # GET : Fetch all addresses of current user
+    # Endpoint:
+    # GET /api/accounts/addresses/
+    # ------------------------------------------------------
     def get(self, request):
 
         addresses = Address.objects.filter(
@@ -125,16 +145,23 @@ class AddressListCreateAPIView(APIView):
 
         return Response(serializer.data)
 
+    # ------------------------------------------------------
+    # POST : Create new address
+    # Endpoint:
+    # POST /api/accounts/addresses/
+    # ------------------------------------------------------
     def post(self, request):
 
         serializer = AddressSerializer(
-            data=request.data
+            data=request.data,
+            context={"request": request}
         )
 
         serializer.is_valid(
             raise_exception=True
         )
 
+        # Logged-in user is assigned automatically
         serializer.save(
             user=request.user
         )
@@ -144,21 +171,36 @@ class AddressListCreateAPIView(APIView):
             status=status.HTTP_201_CREATED
         )
 
-#------------------------------------------------------------------
-# Address Detail API View single address get, update and delete
-# -----------------------------------------------------------------
+
+# ==========================================================
+# Address Detail API
+#
+# GET    -> Single Address
+# PUT    -> Update Complete Address
+# PATCH  -> Partial Update
+# DELETE -> Delete Address
+# ==========================================================
 class AddressDetailAPIView(APIView):
-    
+
     permission_classes = [IsAuthenticated]
 
+    # ------------------------------------------------------
+    # Helper Method
+    # Returns address only if it belongs to logged-in user
+    # ------------------------------------------------------
     def get_object(self, pk, user):
-    
-        return get_object_or_404(
-        Address,
-        pk=pk,
-        user=user
-    )
 
+        return get_object_or_404(
+            Address,
+            pk=pk,
+            user=user
+        )
+
+    # ------------------------------------------------------
+    # GET : Single Address
+    # Endpoint:
+    # GET /api/accounts/addresses/<id>/
+    # ------------------------------------------------------
     def get(self, request, pk):
 
         address = self.get_object(
@@ -172,6 +214,11 @@ class AddressDetailAPIView(APIView):
 
         return Response(serializer.data)
 
+    # ------------------------------------------------------
+    # PUT : Update Entire Address
+    # Endpoint:
+    # PUT /api/accounts/addresses/<id>/
+    # ------------------------------------------------------
     def put(self, request, pk):
 
         address = self.get_object(
@@ -181,7 +228,8 @@ class AddressDetailAPIView(APIView):
 
         serializer = AddressSerializer(
             address,
-            data=request.data
+            data=request.data,
+            context={"request": request}
         )
 
         serializer.is_valid(
@@ -192,6 +240,11 @@ class AddressDetailAPIView(APIView):
 
         return Response(serializer.data)
 
+    # ------------------------------------------------------
+    # PATCH : Partial Update
+    # Endpoint:
+    # PATCH /api/accounts/addresses/<id>/
+    # ------------------------------------------------------
     def patch(self, request, pk):
 
         address = self.get_object(
@@ -202,7 +255,8 @@ class AddressDetailAPIView(APIView):
         serializer = AddressSerializer(
             address,
             data=request.data,
-            partial=True
+            partial=True,
+            context={"request": request}
         )
 
         serializer.is_valid(
@@ -213,6 +267,11 @@ class AddressDetailAPIView(APIView):
 
         return Response(serializer.data)
 
+    # ------------------------------------------------------
+    # DELETE : Delete Address
+    # Endpoint:
+    # DELETE /api/accounts/addresses/<id>/
+    # ------------------------------------------------------
     def delete(self, request, pk):
 
         address = self.get_object(
@@ -224,10 +283,14 @@ class AddressDetailAPIView(APIView):
 
         return Response(
             {
-                "message": "Address deleted successfully"
+                "message": "Address deleted successfully."
             },
             status=status.HTTP_204_NO_CONTENT
         )
+
+
+
+
 #----------------------------------------------------------
 # Forgot Password API View
 # ----------------------------------------------------------
