@@ -30,7 +30,7 @@ SECRET_KEY = 'django-insecure-oi9vzqwd64^ekbp@thlrd=d^0=e-(7i6npu$z*3v$pu#by1t+_
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
 
 # Application definition
@@ -159,6 +159,11 @@ SIMPLE_JWT = {
 
 # CORS Configuration
 CORS_ALLOW_ALL_ORIGINS = True
+
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    "x-guest-id",
+]
 
 # Media files Configuration
 MEDIA_URL = '/media/'

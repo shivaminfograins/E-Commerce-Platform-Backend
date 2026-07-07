@@ -150,7 +150,14 @@ class ResetPasswordSerializer(serializers.Serializer):
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    username = serializers.CharField(required=False)
+    email = serializers.EmailField(required=False, write_only=True)
+
     def validate(self, attrs):
+        # If frontend sent email instead of username, map it for compatibility
+        if "email" in attrs and not attrs.get("username"):
+            attrs["username"] = attrs["email"]
+            
         data = super().validate(attrs)
         
         # Merge guest cart to user cart upon login
@@ -158,8 +165,8 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         if request:
             guest_token = request.headers.get("X-Guest-ID") or request.COOKIES.get("guest_id")
             if guest_token:
-                from apps.cart.views import merge_guest_cart
-                merge_guest_cart(self.user, guest_token)
+                from apps.cart.views import _merge_guest_cart
+                _merge_guest_cart(self.user, guest_token)
 
         data["user"] = {
             "id": self.user.id,
