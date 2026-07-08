@@ -28,6 +28,12 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.username
+
+    def save(self, *args, **kwargs):
+        if self.is_superuser:
+            self.role = "admin"
+            self.is_verified = True
+        super().save(*args, **kwargs)
     
 
 class Profile(models.Model):

@@ -165,8 +165,9 @@ class OrderSummarySerializer(serializers.ModelSerializer):
     delivery_address = serializers.SerializerMethodField()
 
     # ── Preview fields for list views ──────────────────────────────────────
-    first_item_image = serializers.SerializerMethodField()
-    first_item_name  = serializers.SerializerMethodField()
+    first_item_image  = serializers.SerializerMethodField()
+    first_item_name   = serializers.SerializerMethodField()
+    razorpay_order_id = serializers.SerializerMethodField()
 
     class Meta:
         model  = Order

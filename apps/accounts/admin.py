@@ -37,5 +37,31 @@ class AddressAdmin(admin.ModelAdmin):
     )
 
 
-admin.site.register(User)
+from django.contrib.auth.admin import UserAdmin
+
+@admin.register(User)
+class CustomUserAdmin(UserAdmin):
+    # Columns in the list view table
+    list_display = (
+        "username",
+        "email",
+        "role",
+        "is_verified",
+        "is_staff",
+        "is_active",
+        "date_joined",
+    )
+    list_filter = ("role", "is_verified", "is_staff", "is_active")
+    search_fields = ("username", "email")
+    ordering = ("-date_joined",)
+
+    # Fields inside the edit form
+    fieldsets = UserAdmin.fieldsets + (
+        ("Custom Fields", {"fields": ("role", "is_verified")}),
+    )
+    add_fieldsets = UserAdmin.add_fieldsets + (
+        ("Custom Fields", {"fields": ("role", "is_verified")}),
+    )
+
+
 admin.site.register(Profile)

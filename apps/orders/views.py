@@ -54,7 +54,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.db import transaction
 from django.db.models import F, Q
-from rest_framework import generics, filters, status
+from rest_framework import generics, filters, status, serializers
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response

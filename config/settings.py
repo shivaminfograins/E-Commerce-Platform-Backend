@@ -168,3 +168,8 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
 # Media files Configuration
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Razorpay Configuration
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_test_mockkeyid123")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "mocksecret123456789")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "mockwebhooksecret123")
