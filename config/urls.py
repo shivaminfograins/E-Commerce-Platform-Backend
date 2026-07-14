@@ -25,6 +25,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     
     # apps urls
+    path("api/admin/", include("apps.admin_panel.urls")),
     path("api/auth/",include("apps.accounts.urls")),
     path("api/products/",include("apps.products.urls")),
     path("api/wishlist/",include("apps.wishlist.urls")),
