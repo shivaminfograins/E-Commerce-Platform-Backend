@@ -22,14 +22,14 @@ def _cart_queryset():
     select_related("variant__product")
         → fetches CartItem + ProductVariant + Product in ONE SQL JOIN.
 
-    prefetch_related("variant__product__images")
-        → fetches all ProductImage rows for those products in ONE extra
+    prefetch_related("variant__images")
+        → fetches all ProductVariantImage rows for those variants in ONE extra
           SQL query (not N queries), used by CartItemSerializer.get_image().
     """
     return (
         CartItem.objects
         .select_related("variant__product")
-        .prefetch_related("variant__product__images")
+        .prefetch_related("variant__images")
     )
 
 

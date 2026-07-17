@@ -8,7 +8,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from apps.accounts.models import User
-from apps.accounts.serializers import CustomTokenObtainPairSerializer, UserSerializer
+from apps.accounts.serializers import CustomTokenObtainPairSerializer, UserSerializer, AdminCustomerSerializer
 from apps.products.models import Product, Category, ProductVariant
 from apps.orders.models import Order, OrderItem
 from apps.orders.serializers import OrderSummarySerializer
@@ -84,8 +84,8 @@ class AdminDashboardView(APIView):
             context={"request": request}
         ).data
 
-        recent_customers_qs = User.objects.filter(role="customer").order_by("-date_joined")[:5]
-        recent_customers_data = UserSerializer(recent_customers_qs, many=True).data
+        recent_customers_qs = User.objects.filter(role="customer").select_related("profile").order_by("-date_joined")[:5]
+        recent_customers_data = AdminCustomerSerializer(recent_customers_qs, many=True).data
 
         # Top Selling Products
         # Group by product/variant, sum quantity and total revenue
@@ -178,8 +178,8 @@ from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from apps.products.pagination import ProductPagination
-from apps.products.serializers import ProductSerializer, ProductVariantSerializer, ProductImageSerializer
-from apps.products.models import ProductImage
+from apps.products.serializers import ProductSerializer, ProductVariantSerializer, ProductVariantImageSerializer
+from apps.products.models import ProductVariantImage
 
 
 class AdminProductViewSet(viewsets.ModelViewSet):
@@ -233,30 +233,48 @@ class AdminProductVariantViewSet(viewsets.ModelViewSet):
 
 class AdminProductImageViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for admin to manage product images.
+    ViewSet for admin to manage product variant images.
     """
-    serializer_class = ProductImageSerializer
+    serializer_class = ProductVariantImageSerializer
     permission_classes = [AdminPermission]
 
     def get_queryset(self):
         product_id = self.kwargs.get("product_id")
+        variant_id = self.request.query_params.get("variant_id")
+        if variant_id:
+            return ProductVariantImage.objects.filter(variant_id=variant_id).order_by("display_order", "id")
         if product_id:
-            return ProductImage.objects.filter(product_id=product_id).order_by("id")
-        return ProductImage.objects.all().order_by("id")
+            return ProductVariantImage.objects.filter(variant__product_id=product_id).order_by("display_order", "id")
+        return ProductVariantImage.objects.all().order_by("display_order", "id")
 
     def create(self, request, *args, **kwargs):
         product_id = self.kwargs.get("product_id")
-        product = get_object_or_404(Product, pk=product_id)
+        variant_id = request.data.get("variant")
+        
+        if not variant_id:
+            product = get_object_or_404(Product, pk=product_id)
+            variant = product.variants.first()
+            if not variant:
+                variant = ProductVariant.objects.create(
+                    product=product,
+                    name="Default Variant",
+                    sku=f"{product.slug[:10]}-DEFAULT",
+                    price=0.00,
+                    stock=0
+                )
+        else:
+            variant = get_object_or_404(ProductVariant, pk=variant_id)
+            
         data = request.data.copy()
-        data["product"] = product.id
+        data["variant"] = variant.id
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
-        serializer.save(product=product)
+        serializer.save(variant=variant)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 from rest_framework.pagination import PageNumberPagination
-from apps.accounts.serializers import AddressSerializer
+from apps.accounts.serializers import AddressSerializer, AdminCustomerSerializer
 from apps.accounts.models import Address
 
 
@@ -270,8 +288,8 @@ class AdminCustomerViewSet(viewsets.ReadOnlyModelViewSet):
     """
     ViewSet for admin to view and manage customer details.
     """
-    queryset = User.objects.filter(role="customer").order_by("-date_joined")
-    serializer_class = UserSerializer
+    queryset = User.objects.filter(role="customer").select_related("profile").order_by("-date_joined")
+    serializer_class = AdminCustomerSerializer
     permission_classes = [AdminPermission]
     pagination_class = AdminCustomerPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]

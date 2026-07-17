@@ -4,7 +4,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 from django.core.files.uploadedfile import SimpleUploadedFile
 from apps.accounts.models import User, Address
-from apps.products.models import Product, Category, ProductVariant, ProductImage
+from apps.products.models import Product, Category, ProductVariant, ProductVariantImage
 from apps.orders.models import Order, OrderItem
 
 

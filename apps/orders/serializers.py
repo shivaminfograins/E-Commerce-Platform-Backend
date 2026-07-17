@@ -168,6 +168,8 @@ class OrderSummarySerializer(serializers.ModelSerializer):
     first_item_image  = serializers.SerializerMethodField()
     first_item_name   = serializers.SerializerMethodField()
     razorpay_order_id = serializers.SerializerMethodField()
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+    user_username = serializers.CharField(source="user.username", read_only=True)
 
     class Meta:
         model  = Order
@@ -196,6 +198,9 @@ class OrderSummarySerializer(serializers.ModelSerializer):
             "razorpay_order_id",
             "coupon_code",
             "notes",
+            # User details
+            "user_email",
+            "user_username",
             # Timestamps
             "created_at",
             "updated_at",

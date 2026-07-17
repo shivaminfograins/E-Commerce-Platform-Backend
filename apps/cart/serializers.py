@@ -92,12 +92,12 @@ class CartItemSerializer(serializers.ModelSerializer):
 
     def get_image(self, obj):
         """
-        Return the URL of the first ProductImage for the parent product.
-        Requires select_related("variant__product") + prefetch_related("variant__product__images")
+        Return the URL of the first ProductVariantImage for the variant.
+        Requires select_related("variant") + prefetch_related("variant__images")
         in the view queryset to avoid N+1 queries.
         """
         request = self.context.get("request")
-        first_image = obj.variant.product.images.first()
+        first_image = obj.variant.images.first()
         if first_image and first_image.image:
             if request:
                 # Build an absolute URL (includes http://host)

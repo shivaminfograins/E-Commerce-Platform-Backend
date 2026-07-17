@@ -25,6 +25,44 @@ class UserSerializer(serializers.ModelSerializer):
         ]
 
 
+class AdminCustomerSerializer(serializers.ModelSerializer):
+    """
+    Extended serializer for admin customer management.
+    Includes is_active, date_joined, and phone from the related Profile.
+    """
+    phone = serializers.SerializerMethodField()
+    avatar = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "email",
+            "username",
+            "role",
+            "is_active",
+            "is_verified",
+            "date_joined",
+            "phone",
+            "avatar",
+        ]
+        read_only_fields = ["id", "role", "is_verified", "date_joined"]
+
+    def get_phone(self, obj):
+        try:
+            return obj.profile.phone or ""
+        except Exception:
+            return ""
+
+    def get_avatar(self, obj):
+        try:
+            if obj.profile.profile_image:
+                return obj.profile.profile_image.url
+        except Exception:
+            pass
+        return None
+
+
 class RegisterSerializer(serializers.ModelSerializer):
     
     password = serializers.CharField(
