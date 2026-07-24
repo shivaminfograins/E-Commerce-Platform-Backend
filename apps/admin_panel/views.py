@@ -452,7 +452,9 @@ class AdminOrderViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 from rest_framework import viewsets
-from django.db.models.functions import TruncMonth
+from django.db.models.functions import TruncMonth, TruncDay, TruncHour
+from django.utils.dateparse import parse_date
+import datetime
 from apps.accounts.serializers import ProfileSerializer
 from .models import AppSetting
 
@@ -463,30 +465,132 @@ class AdminReportsViewSet(viewsets.ViewSet):
     """
     permission_classes = [AdminPermission]
 
+    def _get_trend_data(self, request, query_type):
+        """
+        query_type can be: "sales", "revenue", "orders"
+        """
+        # Parse params
+        time_range = request.query_params.get("range", "yearly")
+        particular_date_str = request.query_params.get("date")
+        
+        now = timezone.now()
+        start_date = None
+        end_date = None
+        group_by = "month"
+        
+        dummy_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        days = []
+        hours = []
+        
+        if time_range == "weekly":
+            start_date = now - datetime.timedelta(days=6)
+            group_by = "day"
+            for i in range(7):
+                d = now - datetime.timedelta(days=6-i)
+                days.append(d.strftime("%b %d"))
+        elif time_range == "monthly":
+            start_date = now - datetime.timedelta(days=29)
+            group_by = "day"
+            for i in range(30):
+                d = now - datetime.timedelta(days=29-i)
+                days.append(d.strftime("%b %d"))
+        elif time_range == "custom" and particular_date_str:
+            try:
+                chosen_date = parse_date(particular_date_str)
+                if chosen_date:
+                    start_date = timezone.make_aware(datetime.datetime.combine(chosen_date, datetime.time.min))
+                    end_date = timezone.make_aware(datetime.datetime.combine(chosen_date, datetime.time.max))
+                    group_by = "hour"
+                    hours = [f"{h:02d}:00" for h in range(24)]
+            except Exception:
+                pass
+        
+        # Determine base queryset and filter fields
+        if query_type == "sales":
+            qs = OrderItem.objects.exclude(order__status__in=[Order.CANCELLED, Order.REFUNDED])
+            date_field = "order__created_at"
+        elif query_type == "revenue":
+            qs = Order.objects.exclude(status__in=[Order.CANCELLED, Order.REFUNDED])
+            date_field = "created_at"
+        else: # orders
+            qs = Order.objects.all()
+            date_field = "created_at"
+            
+        # Apply date filters
+        if start_date:
+            if group_by == "hour" and end_date:
+                qs = qs.filter(**{f"{date_field}__range": (start_date, end_date)})
+            else:
+                qs = qs.filter(**{f"{date_field}__gte": start_date})
+        else:
+            # Default yearly: current year
+            qs = qs.filter(**{f"{date_field}__year": now.year})
+            
+        # Group and annotate
+        if group_by == "month":
+            trunc_fn = TruncMonth(date_field)
+            monthly = qs.annotate(trunc=trunc_fn).values("trunc")
+            if query_type == "sales":
+                monthly = monthly.annotate(val=Sum("quantity"))
+            elif query_type == "revenue":
+                monthly = monthly.annotate(val=Sum("total_amount"))
+            else: # orders
+                monthly = monthly.annotate(val=Count("id"))
+                
+            trend = {m: 0 for m in dummy_months}
+            for entry in monthly:
+                if entry["trunc"]:
+                    m_name = entry["trunc"].strftime("%b")
+                    val = entry["val"] or 0
+                    trend[m_name] = float(val) if query_type == "revenue" else int(val)
+            return [{"month": m, query_type: trend[m]} for m in dummy_months]
+            
+        elif group_by == "day":
+            trunc_fn = TruncDay(date_field)
+            daily = qs.annotate(trunc=trunc_fn).values("trunc")
+            if query_type == "sales":
+                daily = daily.annotate(val=Sum("quantity"))
+            elif query_type == "revenue":
+                daily = daily.annotate(val=Sum("total_amount"))
+            else: # orders
+                daily = daily.annotate(val=Count("id"))
+                
+            trend = {d_str: 0 for d_str in days}
+            for entry in daily:
+                if entry["trunc"]:
+                    d_str = entry["trunc"].strftime("%b %d")
+                    if d_str in trend:
+                        val = entry["val"] or 0
+                        trend[d_str] = float(val) if query_type == "revenue" else int(val)
+            return [{"month": d_str, query_type: trend[d_str]} for d_str in days]
+            
+        elif group_by == "hour":
+            trunc_fn = TruncHour(date_field)
+            hourly = qs.annotate(trunc=trunc_fn).values("trunc")
+            if query_type == "sales":
+                hourly = hourly.annotate(val=Sum("quantity"))
+            elif query_type == "revenue":
+                hourly = hourly.annotate(val=Sum("total_amount"))
+            else: # orders
+                hourly = hourly.annotate(val=Count("id"))
+                
+            trend = {h_str: 0 for h_str in hours}
+            for entry in hourly:
+                if entry["trunc"]:
+                    h_str = timezone.localtime(entry["trunc"]).strftime("%H:00")
+                    if h_str in trend:
+                        val = entry["val"] or 0
+                        trend[h_str] = float(val) if query_type == "revenue" else int(val)
+            return [{"month": h_str, query_type: trend[h_str]} for h_str in hours]
+
     def sales(self, request):
         now = timezone.now()
         # Total Sales: quantity sum of non-cancelled/non-refunded orders
         sales_qs = OrderItem.objects.exclude(order__status__in=[Order.CANCELLED, Order.REFUNDED])
         total_sales = sales_qs.aggregate(total=Sum("quantity"))["total"] or 0
 
-        # Monthly trends
-        order_monthly = Order.objects.filter(
-            created_at__year=now.year
-        ).exclude(
-            status__in=[Order.CANCELLED, Order.REFUNDED]
-        ).annotate(month_trunc=TruncMonth("created_at")) \
-         .values("month_trunc") \
-         .annotate(orders=Count("id")) \
-         .order_by("month_trunc")
-
-        dummy_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        sales_trend = {m: 0 for m in dummy_months}
-        for entry in order_monthly:
-            if entry["month_trunc"]:
-                month_name = entry["month_trunc"].strftime("%b")
-                sales_trend[month_name] = entry["orders"]
-
-        trend_data = [{"month": m, "orders": sales_trend[m]} for m in dummy_months]
+        trend_data = self._get_trend_data(request, "sales")
+        trend_data = [{"month": x["month"], "sales": x["sales"], "orders": x["sales"]} for x in trend_data]
 
         return Response({
             "value": str(total_sales),
@@ -496,25 +600,10 @@ class AdminReportsViewSet(viewsets.ViewSet):
         }, status=status.HTTP_200_OK)
 
     def revenue(self, request):
-        now = timezone.now()
         revenue_qs = Order.objects.exclude(status__in=[Order.CANCELLED, Order.REFUNDED])
         total_revenue = revenue_qs.aggregate(total=Sum("total_amount"))["total"] or Decimal("0.00")
 
-        order_monthly = revenue_qs.filter(
-            created_at__year=now.year
-        ).annotate(month_trunc=TruncMonth("created_at")) \
-         .values("month_trunc") \
-         .annotate(revenue=Sum("total_amount")) \
-         .order_by("month_trunc")
-
-        dummy_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        revenue_trend = {m: Decimal("0.00") for m in dummy_months}
-        for entry in order_monthly:
-            if entry["month_trunc"]:
-                month_name = entry["month_trunc"].strftime("%b")
-                revenue_trend[month_name] = entry["revenue"] or Decimal("0.00")
-
-        trend_data = [{"month": m, "revenue": float(revenue_trend[m])} for m in dummy_months]
+        trend_data = self._get_trend_data(request, "revenue")
 
         return Response({
             "value": f"₹{total_revenue:,.2f}",
@@ -524,24 +613,9 @@ class AdminReportsViewSet(viewsets.ViewSet):
         }, status=status.HTTP_200_OK)
 
     def orders(self, request):
-        now = timezone.now()
         total_orders = Order.objects.count()
 
-        order_monthly = Order.objects.filter(
-            created_at__year=now.year
-        ).annotate(month_trunc=TruncMonth("created_at")) \
-         .values("month_trunc") \
-         .annotate(orders=Count("id")) \
-         .order_by("month_trunc")
-
-        dummy_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        orders_trend = {m: 0 for m in dummy_months}
-        for entry in order_monthly:
-            if entry["month_trunc"]:
-                month_name = entry["month_trunc"].strftime("%b")
-                orders_trend[month_name] = entry["orders"]
-
-        trend_data = [{"month": m, "orders": orders_trend[m]} for m in dummy_months]
+        trend_data = self._get_trend_data(request, "orders")
 
         # Status distribution
         status_dist = Order.objects.values("status").annotate(count=Count("id"))

@@ -197,7 +197,7 @@ class PlaceOrderView(APIView):
             .select_related(
                 "variant__product",
             )
-            .prefetch_related("variant__product__images")
+            .prefetch_related("variant__images")
         )
 
         if not cart_items:
@@ -338,7 +338,7 @@ class PlaceOrderView(APIView):
                 # Resolve image URL from the pre-fetched related manager.
                 # all() iterates the in-memory prefetch cache — zero extra DB queries.
                 image_url = ""
-                first_image = p.images.first()
+                first_image = v.images.first()
                 if first_image and first_image.image:
                     try:
                         image_url = request.build_absolute_uri(
