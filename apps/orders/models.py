@@ -320,6 +320,15 @@ class Order(models.Model):
     # MISC
     # ───────────────────────────────────────────────────────────────────────
 
+    coupon = models.ForeignKey(
+        "coupons.Coupon",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="orders",
+        help_text="The Coupon object applied to this order.",
+    )
+
     coupon_code = models.CharField(
         max_length=50,
         blank=True,

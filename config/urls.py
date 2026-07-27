@@ -32,6 +32,7 @@ urlpatterns = [
     path("api/cart/", include("apps.cart.urls")),
     path("api/orders/", include("apps.orders.urls")),
     path("api/payments/", include("apps.payments.urls")),
+    path("api/coupons/", include("apps.coupons.urls")),
     
     # JWT Authentication urls
     path("api/auth/login/",CustomTokenObtainPairView.as_view(),name="token_obtain_pair",),

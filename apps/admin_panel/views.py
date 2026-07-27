@@ -131,6 +131,14 @@ class AdminDashboardView(APIView):
             for v in out_of_stock_variants
         ]
 
+        # Coupon stats
+        from django.db.models import Count
+        coupon_orders = Order.objects.exclude(coupon_code="").count()
+        today_discount_given = Order.objects.filter(created_at__date=now.date()).aggregate(total=Sum("discount"))["total"] or Decimal("0.00")
+        most_used_coupon_qs = Order.objects.exclude(coupon_code="").values("coupon_code").annotate(usage=Count("id")).order_by("-usage").first()
+        most_used_coupon = most_used_coupon_qs["coupon_code"] if most_used_coupon_qs else "N/A"
+        revenue_after_discounts = total_revenue
+
         return Response({
             "total_products": total_products,
             "total_categories": total_categories,
@@ -146,6 +154,10 @@ class AdminDashboardView(APIView):
             "top_selling_products": list(top_selling),
             "low_stock_products": low_stock_data,
             "out_of_stock_products": out_of_stock_data,
+            "coupon_orders": coupon_orders,
+            "today_discount_given": str(today_discount_given),
+            "most_used_coupon": most_used_coupon,
+            "revenue_after_discounts": str(revenue_after_discounts),
         }, status=status.HTTP_200_OK)
 
 
@@ -678,6 +690,30 @@ class AdminReportsViewSet(viewsets.ViewSet):
             "category_distribution": cat_data,
             "top_products": list(top_selling)
         }, status=status.HTTP_200_OK)
+
+    def coupons(self, request):
+        from django.db.models import Sum, Avg, Count
+        
+        # Aggregate by coupon_code snapshot to handle deleted coupons as well
+        coupon_stats = Order.objects.exclude(coupon_code="").values('coupon_code').annotate(
+            usage_count=Count('id'),
+            revenue_generated=Sum('total_amount'),
+            total_discount_given=Sum('discount'),
+            average_order_value=Avg('total_amount')
+        ).order_by('-usage_count')
+
+        data = [
+            {
+                "coupon_code": entry["coupon_code"],
+                "usage_count": entry["usage_count"],
+                "revenue_generated": str(entry["revenue_generated"] or Decimal("0.00")),
+                "total_discount_given": str(entry["total_discount_given"] or Decimal("0.00")),
+                "average_order_value": str(entry["average_order_value"] or Decimal("0.00")),
+            }
+            for entry in coupon_stats
+        ]
+
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class AdminProfileView(APIView):

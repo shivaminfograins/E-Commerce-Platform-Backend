@@ -15,6 +15,7 @@ from .views import (
     AdminChangePasswordView,
     AdminSettingsView,
 )
+from apps.coupons.views import AdminCouponViewSet
 
 router = DefaultRouter()
 router.register("categories", AdminCategoryViewSet, basename="admin-categories")
@@ -22,6 +23,7 @@ router.register("products", AdminProductViewSet, basename="admin-products")
 router.register("customers", AdminCustomerViewSet, basename="admin-customers")
 router.register("addresses", AdminAddressViewSet, basename="admin-addresses")
 router.register("orders", AdminOrderViewSet, basename="admin-orders")
+router.register("coupons", AdminCouponViewSet, basename="admin-coupons")
 
 urlpatterns = [
     path("auth/login/", AdminLoginView.as_view(), name="admin_login"),
@@ -33,6 +35,7 @@ urlpatterns = [
     path("reports/orders/", AdminReportsViewSet.as_view({"get": "orders"}), name="admin-reports-orders"),
     path("reports/customers/", AdminReportsViewSet.as_view({"get": "customers"}), name="admin-reports-customers"),
     path("reports/products/", AdminReportsViewSet.as_view({"get": "products"}), name="admin-reports-products"),
+    path("reports/coupons/", AdminReportsViewSet.as_view({"get": "coupons"}), name="admin-reports-coupons"),
 
     # Profile & settings
     path("profile/", AdminProfileView.as_view(), name="admin-profile"),

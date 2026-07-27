@@ -29,6 +29,7 @@ Design rules
 from rest_framework import serializers
 
 from .models import Order, OrderItem
+from apps.coupons.serializers import CouponSerializer
 
 
 # ===========================================================================
@@ -170,6 +171,10 @@ class OrderSummarySerializer(serializers.ModelSerializer):
     razorpay_order_id = serializers.SerializerMethodField()
     user_email = serializers.EmailField(source="user.email", read_only=True)
     user_username = serializers.CharField(source="user.username", read_only=True)
+    
+    coupon = CouponSerializer(read_only=True)
+    discount_amount = serializers.DecimalField(source="discount", max_digits=10, decimal_places=2, read_only=True)
+    grand_total = serializers.DecimalField(source="total_amount", max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         model  = Order
@@ -187,8 +192,10 @@ class OrderSummarySerializer(serializers.ModelSerializer):
             "subtotal",
             "shipping_charge",
             "discount",
+            "discount_amount",
             "tax",
             "total_amount",
+            "grand_total",
             # Convenience
             "item_count",
             "is_cancellable",
@@ -196,6 +203,7 @@ class OrderSummarySerializer(serializers.ModelSerializer):
             "first_item_image",
             "first_item_name",
             "razorpay_order_id",
+            "coupon",
             "coupon_code",
             "notes",
             # User details

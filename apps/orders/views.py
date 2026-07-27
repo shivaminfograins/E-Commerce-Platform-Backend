@@ -253,7 +253,32 @@ class PlaceOrderView(APIView):
             else SHIPPING_FEE
         )
         tax      = (subtotal * TAX_RATE).quantize(Decimal("0.01"))
-        discount = Decimal("0.00")   # extend with coupon logic here
+        
+        # ── Coupon Validation ──────────────────────────────────────────
+        discount = Decimal("0.00")
+        coupon_code = data.get("coupon_code", "").upper().strip()
+        coupon = None
+        if coupon_code:
+            from apps.coupons.models import Coupon
+            from apps.coupons.views import validate_coupon_for_user
+            coupon = Coupon.objects.filter(code__iexact=coupon_code).first()
+            if not coupon:
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Coupon code '{coupon_code}' is invalid.",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            is_valid, err_msg, discount = validate_coupon_for_user(coupon, request.user, subtotal)
+            if not is_valid:
+                return Response(
+                    {
+                        "success": False,
+                        "message": err_msg,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # ── Steps 6–10: Atomic database operations ────────────────────
         with transaction.atomic():
@@ -292,9 +317,20 @@ class PlaceOrderView(APIView):
                 tax=tax,
                 total_amount=subtotal + shipping_charge + tax - discount,
                 # ── Misc ──────────────────────────────────────────────
-                coupon_code=data.get("coupon_code", ""),
+                coupon=coupon,
+                coupon_code=coupon.code if coupon else "",
                 notes=data.get("notes", ""),
             )
+
+            # Record Coupon Usage
+            if coupon:
+                from apps.coupons.models import CouponUsage
+                CouponUsage.objects.create(
+                    coupon=coupon,
+                    user=request.user,
+                    order=order
+                )
+                Coupon.objects.filter(pk=coupon.pk).update(usage_count=F("usage_count") + 1)
 
             # ── Razorpay Order Creation ──────────────────────────────
             if data["payment_method"] == Order.RAZORPAY:
