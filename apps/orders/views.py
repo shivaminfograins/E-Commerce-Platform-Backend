@@ -685,3 +685,334 @@ class CancelOrderView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class DownloadInvoiceView(APIView):
+    """
+    Generates a professional, legally-compliant PDF Tax Invoice
+    and returns it as a binary PDF attachment.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            order = Order.objects.prefetch_related("items").get(pk=pk, user=request.user)
+        except Order.DoesNotExist:
+            return Response(
+                {"success": False, "message": "Order not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        import io
+        from django.http import FileResponse
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            rightMargin=36,
+            leftMargin=36,
+            topMargin=36,
+            bottomMargin=36
+        )
+
+        styles = getSampleStyleSheet()
+        
+        # Define clean, professional text styles
+        title_style = ParagraphStyle(
+            "InvoiceTitle",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=18,
+            leading=22,
+            textColor=colors.HexColor("#0f172a")
+        )
+        
+        bold_lbl_style = ParagraphStyle(
+            "BoldLabel",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=9,
+            leading=11,
+            textColor=colors.HexColor("#334155")
+        )
+        
+        val_style = ParagraphStyle(
+            "ValueStyle",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#475569")
+        )
+
+        val_bold_style = ParagraphStyle(
+            "ValueBoldStyle",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#1e293b")
+        )
+
+        tbl_hdr_style = ParagraphStyle(
+            "TableHeader",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#1e293b")
+        )
+
+        tbl_cell_style = ParagraphStyle(
+            "TableCell",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#334155")
+        )
+
+        tbl_cell_right = ParagraphStyle(
+            "TableCellRight",
+            parent=tbl_cell_style,
+            alignment=2 # Right align
+        )
+
+        tbl_cell_bold_right = ParagraphStyle(
+            "TableCellBoldRight",
+            parent=tbl_cell_style,
+            fontName="Helvetica-Bold",
+            alignment=2
+        )
+
+        story = []
+
+        # ── 1. Company Identity & Invoice Header (Two Columns) ──
+        company_info = """<b>Sold By:</b><br/>
+<b>ShopEase Retail Private Limited</b><br/>
+123 Tech Park, Phase II, Scheme 54,<br/>
+Indore, Madhya Pradesh, 452001<br/>
+<b>GSTIN:</b> 23AAACS1234A1Z1<br/>
+<b>PAN:</b> AAACS1234A | <b>CIN:</b> U72200MP2026PTC123456<br/>
+<b>Email:</b> billing@shopease.com | <b>Phone:</b> +91 731 555 1234
+"""
+        
+        invoice_date_str = order.created_at.strftime("%Y-%m-%d %H:%M")
+        invoice_num = f"INV-{order.created_at.strftime('%Y%m%d')}-{order.id:04d}"
+        
+        meta_info = f"""<font size="16"><b>TAX INVOICE</b></font><br/><br/>
+<b>Invoice Number:</b> {invoice_num}<br/>
+<b>Invoice Date:</b> {invoice_date_str}<br/>
+<b>Order Number:</b> {order.order_number}<br/>
+<b>Order Date:</b> {invoice_date_str}<br/>
+<b>Payment Method:</b> {order.get_payment_method_display()}
+"""
+
+        header_data = [
+            [Paragraph(meta_info, val_style), Paragraph(company_info, val_style)]
+        ]
+        header_table = Table(header_data, colWidths=[260, 260])
+        header_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ]))
+        story.append(header_table)
+        story.append(Spacer(1, 10))
+
+        # Thin divider
+        divider = Table([[""]], colWidths=[522])
+        divider.setStyle(TableStyle([
+            ('LINEABOVE', (0, 0), (-1, -1), 1, colors.HexColor("#e2e8f0")),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+            ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ]))
+        story.append(divider)
+        story.append(Spacer(1, 10))
+
+        # ── 2. Shipping & Billing Address (Side-by-side) ──
+        billing_address = f"""<b>Billing Address:</b><br/>
+{order.snapshot_full_name}<br/>
+{order.snapshot_address_line_1}<br/>
+{order.snapshot_address_line_2}<br/>
+{order.snapshot_city}, {order.snapshot_state} – {order.snapshot_postal_code}<br/>
+{order.snapshot_country}<br/>
+Phone: {order.snapshot_phone}
+"""
+        
+        shipping_address = f"""<b>Shipping Address:</b><br/>
+{order.snapshot_full_name}<br/>
+{order.snapshot_address_line_1}<br/>
+{order.snapshot_address_line_2}<br/>
+{order.snapshot_city}, {order.snapshot_state} – {order.snapshot_postal_code}<br/>
+{order.snapshot_country}<br/>
+Phone: {order.snapshot_phone}
+"""
+
+        addr_data = [
+            [Paragraph(billing_address, val_style), Paragraph(shipping_address, val_style)]
+        ]
+        addr_table = Table(addr_data, colWidths=[260, 260])
+        addr_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ]))
+        story.append(addr_table)
+        story.append(Spacer(1, 10))
+        story.append(divider)
+        story.append(Spacer(1, 10))
+
+        # ── 3. Products Table ──
+        # Check if IGST or CGST+SGST applies
+        is_mp = order.snapshot_state.strip().lower() in ["madhya pradesh", "mp"]
+        tax_type = "CGST/SGST" if is_mp else "IGST"
+        tax_rate_percent = 18
+        
+        table_data = [
+            [
+                Paragraph("<b>S.No.</b>", tbl_hdr_style),
+                Paragraph("<b>Product Description</b>", tbl_hdr_style),
+                Paragraph("<b>SKU</b>", tbl_hdr_style),
+                Paragraph("<b>HSN</b>", tbl_hdr_style),
+                Paragraph("<b>Qty</b>", tbl_hdr_style),
+                Paragraph("<b>Unit Price</b>", tbl_hdr_style),
+                Paragraph("<b>Gross Amt</b>", tbl_hdr_style),
+                Paragraph("<b>Tax Rate</b>", tbl_hdr_style),
+                Paragraph("<b>Tax Type</b>", tbl_hdr_style),
+                Paragraph("<b>Tax Amt</b>", tbl_hdr_style),
+                Paragraph("<b>Total</b>", tbl_hdr_style),
+            ]
+        ]
+
+        # Calculate pro-rata tax and discounts per item
+        # If total_amount and subtotal are present, we can derive the multiplier:
+        # subtotal / total_amount or calculate details based on order-level discount/tax.
+        # Let's compute accurate item breakdowns.
+        items = order.items.all()
+        for idx, item in enumerate(items, 1):
+            hsn_code = "8517 12 00"  # default electronic HSN
+            
+            # Simple tax calculation: 18% inclusive or exclusive.
+            # Let's say unit price is base price.
+            gross_amount = item.price * item.quantity
+            
+            # Pro-rata discount
+            item_discount = Decimal("0.00")
+            if order.subtotal > 0:
+                item_discount = (gross_amount / order.subtotal) * order.discount
+            
+            taxable_val = gross_amount - item_discount
+            
+            # Pro-rata tax
+            item_tax = Decimal("0.00")
+            if order.subtotal > 0:
+                item_tax = (gross_amount / order.subtotal) * order.tax
+            
+            total_val = taxable_val + item_tax
+
+            table_data.append([
+                Paragraph(str(idx), tbl_cell_style),
+                Paragraph(f"<b>{item.product_name}</b><br/>{item.variant_name}", tbl_cell_style),
+                Paragraph(item.sku or "N/A", tbl_cell_style),
+                Paragraph(hsn_code, tbl_cell_style),
+                Paragraph(str(item.quantity), tbl_cell_style),
+                Paragraph(f"₹{item.price:.2f}", tbl_cell_right),
+                Paragraph(f"₹{gross_amount:.2f}", tbl_cell_right),
+                Paragraph(f"{tax_rate_percent}%", tbl_cell_right),
+                Paragraph(tax_type, tbl_cell_style),
+                Paragraph(f"₹{item_tax:.2f}", tbl_cell_right),
+                Paragraph(f"₹{total_val:.2f}", tbl_cell_right),
+            ])
+
+        # Table styling
+        prod_table = Table(table_data, colWidths=[25, 110, 50, 45, 25, 50, 50, 35, 45, 45, 42])
+        prod_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f8fafc")),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        story.append(prod_table)
+        story.append(Spacer(1, 15))
+
+        # ── 4. Summary & Totals (Bottom-Right aligned) ──
+        tax_str = f"₹{order.tax:.2f}"
+        cgst_val = Decimal("0.00")
+        sgst_val = Decimal("0.00")
+        igst_val = Decimal("0.00")
+        
+        if is_mp:
+            cgst_val = order.tax / 2
+            sgst_val = order.tax / 2
+        else:
+            igst_val = order.tax
+
+        summary_rows = [
+            [Paragraph("Subtotal", tbl_cell_style), Paragraph(f"₹{order.subtotal:.2f}", tbl_cell_right)],
+            [Paragraph("Shipping Charges", tbl_cell_style), Paragraph(f"₹{order.shipping_charge:.2f}", tbl_cell_right)],
+            [Paragraph("Discount", tbl_cell_style), Paragraph(f"-₹{order.discount:.2f}", tbl_cell_right)],
+        ]
+        
+        if is_mp:
+            summary_rows.append([Paragraph("CGST (9%)", tbl_cell_style), Paragraph(f"₹{cgst_val:.2f}", tbl_cell_right)])
+            summary_rows.append([Paragraph("SGST (9%)", tbl_cell_style), Paragraph(f"₹{sgst_val:.2f}", tbl_cell_right)])
+        else:
+            summary_rows.append([Paragraph("IGST (18%)", tbl_cell_style), Paragraph(f"₹{igst_val:.2f}", tbl_cell_right)])
+            
+        summary_rows.append([Paragraph("<b>Grand Total</b>", bold_lbl_style), Paragraph(f"<b>₹{order.total_amount:.2f}</b>", tbl_cell_bold_right)])
+        summary_rows.append([Paragraph("<b>Amount Paid</b>", bold_lbl_style), Paragraph(f"<b>₹{order.total_amount:.2f}</b>", tbl_cell_bold_right)])
+
+        summary_table = Table(summary_rows, colWidths=[150, 100])
+        summary_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ('BACKGROUND', (0, -2), (-1, -1), colors.HexColor("#f8fafc")),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ]))
+
+        # Align the summary table to the right
+        outer_summary_table = Table([[ "", summary_table ]], colWidths=[272, 250])
+        outer_summary_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ]))
+        story.append(outer_summary_table)
+        story.append(Spacer(1, 20))
+
+        # ── 5. Declaration & Signatory Section ──
+        declaration_text = """<b>Declaration:</b><br/>
+1. We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.<br/>
+2. This is a computer-generated tax invoice and does not require a physical signature.
+"""
+        
+        sign_data = [
+            [
+                Paragraph(declaration_text, tbl_cell_style),
+                Paragraph("<b>For ShopEase Retail Private Limited</b><br/><br/><br/><br/>Authorized Signatory", tbl_cell_right)
+            ]
+        ]
+        sign_table = Table(sign_data, colWidths=[320, 202])
+        sign_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ('PADDING', (0, 0), (-1, -1), 12),
+        ]))
+        
+        story.append(KeepTogether([sign_table]))
+
+        doc.build(story)
+        buffer.seek(0)
+        
+        return FileResponse(
+            buffer,
+            as_attachment=True,
+            filename=f"Tax_Invoice_{order.order_number}.pdf",
+            content_type="application/pdf"
+        )
+

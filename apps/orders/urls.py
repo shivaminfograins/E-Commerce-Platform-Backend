@@ -40,6 +40,7 @@ from .views import (
     OrderDetailView,
     OrderListView,
     PlaceOrderView,
+    DownloadInvoiceView,
 )
 
 app_name = "orders"
@@ -63,6 +64,11 @@ urlpatterns = [
         "<int:pk>/",
         OrderDetailView.as_view(),  # GET  — full detail with items
         name="order-detail",
+    ),
+    path(
+        "<int:pk>/invoice/",
+        DownloadInvoiceView.as_view(),  # GET — PDF Tax Invoice
+        name="order-invoice",
     ),
     path(
         "<int:pk>/cancel/",
