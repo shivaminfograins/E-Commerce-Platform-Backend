@@ -20,6 +20,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from apps.accounts.views import CustomTokenObtainPairView
 from django.conf import settings
 from django.conf.urls.static import static
+from apps.reviews.views import ProductReviewListView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -34,6 +35,8 @@ urlpatterns = [
     path("api/orders/", include("apps.orders.urls")),
     path("api/payments/", include("apps.payments.urls")),
     path("api/coupons/", include("apps.coupons.urls")),
+    path("api/reviews/", include("apps.reviews.urls")),
+    path("api/products/<int:pk>/reviews/", ProductReviewListView.as_view(), name="product-reviews"),
     
     # JWT Authentication urls
     path("api/auth/login/",CustomTokenObtainPairView.as_view(),name="token_obtain_pair",),
