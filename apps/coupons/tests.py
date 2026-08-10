@@ -234,3 +234,167 @@ class CouponOrderIntegrationTests(APITestCase):
         response2 = self.client.post(url, payload)
         self.assertEqual(response2.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(response2.data["success"])
+
+
+class CouponEngineNewFeaturesTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="engine_customer",
+            email="engine@example.com",
+            password="Password123",
+            role="customer"
+        )
+        self.client.force_authenticate(user=self.user)
+        
+        self.category_elec = Category.objects.create(name="Electronics", slug="electronics")
+        self.category_book = Category.objects.create(name="Books", slug="books")
+        
+        self.product_phone = Product.objects.create(name="Phone", slug="phone", category=self.category_elec)
+        self.product_novel = Product.objects.create(name="Novel", slug="novel", category=self.category_book)
+        
+        self.variant_phone = ProductVariant.objects.create(
+            product=self.product_phone, name="Default", sku="PH-1", price=Decimal("100.00"), stock=100
+        )
+        self.variant_novel = ProductVariant.objects.create(
+            product=self.product_novel, name="Default", sku="NV-1", price=Decimal("50.00"), stock=100
+        )
+        
+        self.now = timezone.now()
+
+    def test_coupon_max_purchase_amount(self):
+        # Cart total: 100
+        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        coupon = Coupon.objects.create(
+            code="MAX150",
+            discount_type="fixed",
+            discount_value=Decimal("10.00"),
+            max_purchase_amount=Decimal("80.00"),
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=1),
+            is_active=True
+        )
+        url = reverse("coupon-validate")
+        response = self.client.post(url, {"code": "MAX150"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(response.data["success"])
+
+    def test_coupon_first_order_only(self):
+        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        coupon = Coupon.objects.create(
+            code="FIRSTONLY",
+            discount_type="fixed",
+            discount_value=Decimal("10.00"),
+            first_order_only=True,
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=1),
+            is_active=True
+        )
+        # Should succeed for first order
+        url = reverse("coupon-validate")
+        response = self.client.post(url, {"code": "FIRSTONLY"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+
+        # Create dummy order for user
+        address = Address.objects.create(
+            user=self.user, full_name="John", phone="123", address_line_1="A", city="B", state="C", postal_code="1", country="USA"
+        )
+        Order.objects.create(
+            user=self.user,
+            address=address,
+            payment_method="cod",
+            subtotal=Decimal("100.00"),
+            total_amount=Decimal("100.00")
+        )
+        
+        # Should now fail as not first order
+        response = self.client.post(url, {"code": "FIRSTONLY"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(response.data["success"])
+
+    def test_coupon_category_scoped(self):
+        # 1 Phone (100) + 1 Novel (50) = 150 subtotal
+        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        CartItem.objects.create(user=self.user, variant=self.variant_novel, quantity=1)
+        
+        coupon = Coupon.objects.create(
+            code="ELEC10",
+            discount_type="percentage",
+            discount_value=Decimal("10.00"),
+            coupon_scope="specific_categories",
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=1),
+            is_active=True
+        )
+        coupon.categories.add(self.category_elec)
+        
+        url = reverse("coupon-validate")
+        response = self.client.post(url, {"code": "ELEC10"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # 10% of Phone(100) only = 10, not 15 (10% of 150)
+        self.assertEqual(float(response.data["discount_amount"]), 10.0)
+
+    def test_coupon_product_scoped(self):
+        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        CartItem.objects.create(user=self.user, variant=self.variant_novel, quantity=1)
+        
+        coupon = Coupon.objects.create(
+            code="PHONEONLY",
+            discount_type="percentage",
+            discount_value=Decimal("10.00"),
+            coupon_scope="specific_products",
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=1),
+            is_active=True
+        )
+        # Use through model CouponProduct explicitly
+        from apps.coupons.models import CouponProduct
+        CouponProduct.objects.create(coupon=coupon, product=self.product_phone, min_quantity=1)
+        
+        url = reverse("coupon-validate")
+        response = self.client.post(url, {"code": "PHONEONLY"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # 10% of Phone(100) = 10
+        self.assertEqual(float(response.data["discount_amount"]), 10.0)
+
+    def test_coupon_product_combination(self):
+        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        coupon = Coupon.objects.create(
+            code="COMBO",
+            discount_type="fixed",
+            discount_value=Decimal("20.00"),
+            coupon_scope="product_combination",
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=1),
+            is_active=True
+        )
+        from apps.coupons.models import CouponProduct
+        CouponProduct.objects.create(coupon=coupon, product=self.product_phone, min_quantity=1)
+        CouponProduct.objects.create(coupon=coupon, product=self.product_novel, min_quantity=1)
+
+        url = reverse("coupon-validate")
+        # Fails because Novel is not in the cart
+        response = self.client.post(url, {"code": "COMBO"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Add Novel to cart
+        CartItem.objects.create(user=self.user, variant=self.variant_novel, quantity=1)
+        response = self.client.post(url, {"code": "COMBO"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+
+    def test_coupon_free_shipping(self):
+        CartItem.objects.create(user=self.user, variant=self.variant_novel, quantity=1) # 50.00 subtotal
+        coupon = Coupon.objects.create(
+            code="FREESHIP",
+            discount_type="free_shipping",
+            discount_value=Decimal("0.00"),
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=1),
+            is_active=True
+        )
+        url = reverse("coupon-validate")
+        response = self.client.post(url, {"code": "FREESHIP"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(float(response.data["discount_amount"]), 99.0) # shipping charge is 99
+

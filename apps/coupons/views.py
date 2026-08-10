@@ -13,34 +13,28 @@ from apps.cart.models import CartItem
 from .models import Coupon, CouponUsage
 from .serializers import CouponSerializer, CouponValidateSerializer
 
+from django.core.exceptions import ValidationError
+from .services import CouponValidationService
+
 
 def validate_coupon_for_user(coupon, user, subtotal):
     """
     Common business logic for validating a coupon against a user's current order/cart subtotal.
     Returns (is_valid, error_message, discount_amount)
     """
-    if not coupon.is_active:
-        return False, "This coupon is currently inactive.", Decimal("0.00")
-
-    now = timezone.now()
-    if coupon.start_date > now:
-        return False, "This coupon is not yet valid.", Decimal("0.00")
-    if coupon.end_date < now:
-        return False, "This coupon has expired.", Decimal("0.00")
-
-    if coupon.has_reached_limit():
-        return False, "This coupon has reached its maximum usage limit.", Decimal("0.00")
-
-    user_usage_count = CouponUsage.objects.filter(coupon=coupon, user=user).count()
-    if user_usage_count >= coupon.per_user_limit:
-        return False, "You have already reached the usage limit for this coupon.", Decimal("0.00")
-
-    if subtotal < coupon.min_purchase_amount:
-        return False, f"Minimum purchase amount of ₹{coupon.min_purchase_amount} required to use this coupon.", Decimal("0.00")
-
-    # Compute discount
-    discount_amount = coupon.calculate_discount(subtotal)
-    return True, "", discount_amount
+    cart_items = CartItem.objects.filter(user=user)
+    service = CouponValidationService()
+    try:
+        service.validate(coupon, user, cart_items)
+        discount_amount = service._calculate_discount(coupon, cart_items, subtotal)
+        return True, "", discount_amount
+    except ValidationError as e:
+        msg = e.message if hasattr(e, 'message') else str(e)
+        if hasattr(e, 'message_dict') and e.message_dict:
+            msg = next(iter(e.message_dict.values()))[0]
+        elif hasattr(e, 'messages') and e.messages:
+            msg = e.messages[0]
+        return False, msg, Decimal("0.00")
 
 
 class AdminCouponViewSet(viewsets.ModelViewSet):
