@@ -37,6 +37,102 @@ class AdminLoginView(TokenObtainPairView):
         return response
 
 
+import datetime
+from django.db.models import Sum, Count, Avg, Q, F
+from django.db.models.functions import TruncMonth, TruncDay, TruncHour
+from django.utils.dateparse import parse_date
+
+# Import additional models for payments and reviews
+from apps.payments.models import Transaction
+from apps.reviews.models import ReviewReport
+
+def parse_dashboard_date_range(request):
+    time_range = request.query_params.get("range", "yearly")
+    particular_date_str = request.query_params.get("date")
+    start_date_str = request.query_params.get("start_date")
+    end_date_str = request.query_params.get("end_date")
+    
+    now = timezone.now()
+    start_date = None
+    end_date = None
+    group_by = "month"
+    
+    if time_range == "today":
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+        group_by = "hour"
+        duration = datetime.timedelta(days=1)
+    elif time_range in ["weekly", "last_7_days"]:
+        start_date = (now - datetime.timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = now
+        group_by = "day"
+        duration = datetime.timedelta(days=7)
+    elif time_range in ["monthly", "last_30_days"]:
+        start_date = (now - datetime.timedelta(days=29)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = now
+        group_by = "day"
+        duration = datetime.timedelta(days=30)
+    elif time_range == "this_month":
+        start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_date = now
+        group_by = "day"
+        duration = now - start_date
+    elif time_range == "last_month":
+        first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_date = first_of_this_month - datetime.timedelta(microseconds=1)
+        start_date = end_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        group_by = "day"
+        duration = end_date - start_date
+    elif time_range == "this_year":
+        start_date = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_date = now
+        group_by = "month"
+        duration = now - start_date
+    elif time_range == "custom":
+        if start_date_str:
+            try:
+                start_date = timezone.make_aware(datetime.datetime.combine(parse_date(start_date_str), datetime.time.min))
+            except Exception:
+                pass
+        if end_date_str:
+            try:
+                end_date = timezone.make_aware(datetime.datetime.combine(parse_date(end_date_str), datetime.time.max))
+            except Exception:
+                pass
+                
+        if not start_date and particular_date_str:
+            try:
+                chosen_date = parse_date(particular_date_str)
+                if chosen_date:
+                    start_date = timezone.make_aware(datetime.datetime.combine(chosen_date, datetime.time.min))
+                    end_date = timezone.make_aware(datetime.datetime.combine(chosen_date, datetime.time.max))
+            except Exception:
+                pass
+        
+        if not start_date:
+            start_date = (now - datetime.timedelta(days=29)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if not end_date:
+            end_date = now
+            
+        group_by = "day"
+        delta = end_date - start_date
+        if delta.days <= 1:
+            group_by = "hour"
+        elif delta.days > 30:
+            group_by = "month"
+        duration = delta
+    else: # yearly or default
+        start_date = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_date = now
+        group_by = "month"
+        duration = now - start_date
+
+    prev_start_date = start_date - duration
+    prev_end_date = start_date - datetime.timedelta(microseconds=1)
+    
+    return start_date, end_date, prev_start_date, prev_end_date, group_by
+
+
 class AdminDashboardView(APIView):
     """
     Retrieves key statistics and metrics for the admin dashboard.
@@ -46,38 +142,66 @@ class AdminDashboardView(APIView):
     def get(self, request):
         now = timezone.now()
         
-        # Stat counts
+        # Get start, end, and previous ranges
+        start_date, end_date, prev_start_date, prev_end_date, _ = parse_dashboard_date_range(request)
+
+        # Base non-cancelled, non-refunded orders query for revenue calculations
+        revenue_q_filter = Q(created_at__range=(start_date, end_date)) & ~Q(status__in=[Order.CANCELLED, Order.REFUNDED])
+        prev_revenue_q_filter = Q(created_at__range=(prev_start_date, prev_end_date)) & ~Q(status__in=[Order.CANCELLED, Order.REFUNDED])
+
+        # Life-time metrics
         total_products = Product.objects.count()
         total_categories = Category.objects.count()
         total_customers = User.objects.filter(role="customer").count()
-        total_orders = Order.objects.count()
-        pending_orders = Order.objects.filter(status=Order.PENDING).count()
-        delivered_orders = Order.objects.filter(status=Order.DELIVERED).count()
-        cancelled_orders = Order.objects.filter(status=Order.CANCELLED).count()
+
+        # Date range-filtered orders
+        orders_in_period = Order.objects.filter(created_at__range=(start_date, end_date))
+        total_orders = orders_in_period.count()
+        pending_orders = orders_in_period.filter(status=Order.PENDING).count()
+        delivered_orders = orders_in_period.filter(status=Order.DELIVERED).count()
+        cancelled_orders = orders_in_period.filter(status=Order.CANCELLED).count()
+
+        # Previous period orders for comparison
+        prev_orders_count = Order.objects.filter(created_at__range=(prev_start_date, prev_end_date)).count()
 
         # Revenue computations (excluding cancelled & refunded orders)
-        revenue_qs = Order.objects.exclude(status__in=[Order.CANCELLED, Order.REFUNDED])
+        revenue_qs = Order.objects.filter(revenue_q_filter)
         total_revenue = revenue_qs.aggregate(total=Sum("total_amount"))["total"] or Decimal("0.00")
         
-        monthly_revenue = revenue_qs.filter(
-            created_at__year=now.year,
-            created_at__month=now.month
-        ).aggregate(total=Sum("total_amount"))["total"] or Decimal("0.00")
+        prev_revenue_qs = Order.objects.filter(prev_revenue_q_filter)
+        prev_revenue = prev_revenue_qs.aggregate(total=Sum("total_amount"))["total"] or Decimal("0.00")
+
+        # Average Order Value (AOV)
+        aov = revenue_qs.aggregate(avg=Avg("total_amount"))["avg"] or Decimal("0.00")
+        prev_aov = prev_revenue_qs.aggregate(avg=Avg("total_amount"))["avg"] or Decimal("0.00")
+
+        # Customer growth / signup
+        new_customers = User.objects.filter(role="customer", date_joined__range=(start_date, end_date)).count()
+        prev_new_customers = User.objects.filter(role="customer", date_joined__range=(prev_start_date, prev_end_date)).count()
+
+        # Units Sold
+        units_sold = OrderItem.objects.filter(
+            order__created_at__range=(start_date, end_date)
+        ).exclude(order__status__in=[Order.CANCELLED, Order.REFUNDED]).aggregate(total=Sum("quantity"))["total"] or 0
+
+        prev_units_sold = OrderItem.objects.filter(
+            order__created_at__range=(prev_start_date, prev_end_date)
+        ).exclude(order__status__in=[Order.CANCELLED, Order.REFUNDED]).aggregate(total=Sum("quantity"))["total"] or 0
+
+        # Mathematically correct percentage changes (return None if no data in previous period to avoid division by zero)
+        def calc_growth(current, previous):
+            if not previous or previous == 0:
+                return None
+            return round(((float(current) - float(previous)) / float(previous)) * 100, 2)
+
+        revenue_growth = calc_growth(total_revenue, prev_revenue)
+        orders_growth = calc_growth(total_orders, prev_orders_count)
+        customers_growth = calc_growth(new_customers, prev_new_customers)
+        aov_growth = calc_growth(aov, prev_aov)
+        units_sold_growth = calc_growth(units_sold, prev_units_sold)
 
         # Recent activities (Recent 5)
-        recent_orders_qs = Order.objects.order_by("-created_at")[:5]
-        # Calculate item_count, is_cancellable etc as required by the serializer
-        # Let's annotate or compute item_count on the fly for the serialized output.
-        # OrderSummarySerializer expects 'item_count' and 'is_cancellable' properties/annotations.
-        # Let's check how the serializer works. We can use a list comprehension or annotate.
-        # Let's annotate the queryset to make sure it runs correctly.
         recent_orders_prefetched = Order.objects.prefetch_related("items").order_by("-created_at")[:5]
-
-        # In order.models, is_cancellable is a property, but in DB it's not.
-        # Let's verify if is_cancellable is a property or model field.
-        # Let's check: in the serializer it is a read-only field:
-        # `is_cancellable = serializers.BooleanField(read_only=True)`
-        # If it's a property on the Order model, Serializer will fetch it automatically.
         recent_orders_data = OrderSummarySerializer(
             recent_orders_prefetched, 
             many=True, 
@@ -87,10 +211,10 @@ class AdminDashboardView(APIView):
         recent_customers_qs = User.objects.filter(role="customer").select_related("profile").order_by("-date_joined")[:5]
         recent_customers_data = AdminCustomerSerializer(recent_customers_qs, many=True).data
 
-        # Top Selling Products
-        # Group by product/variant, sum quantity and total revenue
-        top_selling = OrderItem.objects.exclude(order__status__in=[Order.CANCELLED, Order.REFUNDED]) \
-            .values("product_id", "product_name") \
+        # Top Selling Products in selected period
+        top_selling = OrderItem.objects.filter(order__created_at__range=(start_date, end_date)) \
+            .exclude(order__status__in=[Order.CANCELLED, Order.REFUNDED]) \
+            .values("product_id", "product_name", "product__category__name") \
             .annotate(
                 sales=Sum("quantity"),
                 revenue=Sum("total")
@@ -131,13 +255,112 @@ class AdminDashboardView(APIView):
             for v in out_of_stock_variants
         ]
 
-        # Coupon stats
-        from django.db.models import Count
-        coupon_orders = Order.objects.exclude(coupon_code="").count()
-        today_discount_given = Order.objects.filter(created_at__date=now.date()).aggregate(total=Sum("discount"))["total"] or Decimal("0.00")
-        most_used_coupon_qs = Order.objects.exclude(coupon_code="").values("coupon_code").annotate(usage=Count("id")).order_by("-usage").first()
+        # Coupon stats in period
+        coupon_orders = orders_in_period.exclude(coupon_code="").count()
+        period_discount_given = orders_in_period.aggregate(total=Sum("discount"))["total"] or Decimal("0.00")
+        most_used_coupon_qs = orders_in_period.exclude(coupon_code="").values("coupon_code").annotate(usage=Count("id")).order_by("-usage").first()
         most_used_coupon = most_used_coupon_qs["coupon_code"] if most_used_coupon_qs else "N/A"
         revenue_after_discounts = total_revenue
+
+        # Payment overview metrics in period
+        transactions_in_period = Transaction.objects.filter(created_at__range=(start_date, end_date))
+        successful_payments = transactions_in_period.filter(status=Transaction.SUCCESS).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        pending_payments = transactions_in_period.filter(status=Transaction.PENDING).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        failed_payments = transactions_in_period.filter(status=Transaction.FAILED).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        refunded_payments = transactions_in_period.filter(status=Transaction.REFUNDED).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+
+        # Payment method breakdown
+        payment_method_breakdown = list(
+            transactions_in_period.values("payment_method")
+            .annotate(count=Count("id"), total=Sum("amount"))
+            .order_by("-total")
+        )
+
+        # Operational status summary
+        status_dist = list(orders_in_period.values("status").annotate(count=Count("id")))
+
+        # Category distribution / performance in selected period
+        cat_dist = OrderItem.objects.filter(order__created_at__range=(start_date, end_date)) \
+            .exclude(order__status__in=[Order.CANCELLED, Order.REFUNDED]) \
+            .values("product__category__name") \
+            .annotate(
+                value=Count("id"),
+                sales=Sum("quantity"),
+                revenue=Sum("total")
+            ).order_by("-revenue")
+        cat_data = [
+            {
+                "name": entry["product__category__name"] or "Uncategorized",
+                "value": entry["value"],
+                "sales": entry["sales"] or 0,
+                "revenue": str(entry["revenue"] or Decimal("0.00")),
+            }
+            for entry in cat_dist
+        ]
+
+        # Action Required computations
+        actions = []
+        
+        # 1. Out of stock products
+        out_of_stock_count = ProductVariant.objects.filter(stock=0).count()
+        if out_of_stock_count > 0:
+            actions.append({
+                "type": "out_of_stock",
+                "severity": "danger",
+                "count": out_of_stock_count,
+                "message": f"{out_of_stock_count} Variants are Out of Stock",
+                "link": "/admin/products",
+                "button_text": "Review Inventory"
+            })
+
+        # 2. Low stock products
+        low_stock_count = ProductVariant.objects.filter(stock__gt=0, stock__lte=10).count()
+        if low_stock_count > 0:
+            actions.append({
+                "type": "low_stock",
+                "severity": "warning",
+                "count": low_stock_count,
+                "message": f"{low_stock_count} Variants have Low Stock",
+                "link": "/admin/products",
+                "button_text": "Review Inventory"
+            })
+
+        # 3. Orders pending processing for more than 48 hours
+        delay_threshold = now - datetime.timedelta(hours=48)
+        unprocessed_orders_count = Order.objects.filter(status=Order.PENDING, created_at__lt=delay_threshold).count()
+        if unprocessed_orders_count > 0:
+            actions.append({
+                "type": "unprocessed_orders",
+                "severity": "danger",
+                "count": unprocessed_orders_count,
+                "message": f"{unprocessed_orders_count} Orders Pending > 48 Hours",
+                "link": "/admin/orders",
+                "button_text": "Review Orders"
+            })
+
+        # 4. Failed payments requiring review
+        failed_payments_count = Transaction.objects.filter(status=Transaction.FAILED, created_at__range=(start_date, end_date)).count()
+        if failed_payments_count > 0:
+            actions.append({
+                "type": "failed_payments",
+                "severity": "warning",
+                "count": failed_payments_count,
+                "message": f"{failed_payments_count} Failed Payments Require Review",
+                "link": "/admin/orders",  # orders page lists payment status
+                "button_text": "Review Payments"
+            })
+
+        # 5. Pending review reports
+        pending_reports_count = ReviewReport.objects.filter(status=ReviewReport.PENDING).count()
+        if pending_reports_count > 0:
+            actions.append({
+                "type": "pending_reviews",
+                "severity": "warning",
+                "count": pending_reports_count,
+                "message": f"{pending_reports_count} Reported Reviews Require Moderation",
+                "link": "/admin/reviews",
+                "button_text": "Moderate Reviews"
+            })
 
         return Response({
             "total_products": total_products,
@@ -148,16 +371,37 @@ class AdminDashboardView(APIView):
             "delivered_orders": delivered_orders,
             "cancelled_orders": cancelled_orders,
             "revenue": str(total_revenue),
-            "monthly_revenue": str(monthly_revenue),
+            "monthly_revenue": str(total_revenue),  # keep for legacy fallback
             "recent_orders": recent_orders_data,
             "recent_customers": recent_customers_data,
             "top_selling_products": list(top_selling),
             "low_stock_products": low_stock_data,
             "out_of_stock_products": out_of_stock_data,
             "coupon_orders": coupon_orders,
-            "today_discount_given": str(today_discount_given),
+            "today_discount_given": str(period_discount_given),
             "most_used_coupon": most_used_coupon,
             "revenue_after_discounts": str(revenue_after_discounts),
+            
+            # New metrics
+            "average_order_value": str(aov),
+            "units_sold": units_sold,
+            "growth": {
+                "revenue": revenue_growth,
+                "orders": orders_growth,
+                "customers": customers_growth,
+                "aov": aov_growth,
+                "units_sold": units_sold_growth,
+            },
+            "payment_overview": {
+                "successful_amount": str(successful_payments),
+                "pending_amount": str(pending_payments),
+                "failed_amount": str(failed_payments),
+                "refunded_amount": str(refunded_payments),
+                "breakdown": payment_method_breakdown
+            },
+            "order_status_summary": status_dist,
+            "category_distribution": cat_data,
+            "action_required": actions,
         }, status=status.HTTP_200_OK)
 
 
@@ -481,41 +725,22 @@ class AdminReportsViewSet(viewsets.ViewSet):
         """
         query_type can be: "sales", "revenue", "orders"
         """
-        # Parse params
-        time_range = request.query_params.get("range", "yearly")
-        particular_date_str = request.query_params.get("date")
+        start_date, end_date, _, _, group_by = parse_dashboard_date_range(request)
         
         now = timezone.now()
-        start_date = None
-        end_date = None
-        group_by = "month"
         
         dummy_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
         days = []
         hours = []
         
-        if time_range == "weekly":
-            start_date = now - datetime.timedelta(days=6)
-            group_by = "day"
-            for i in range(7):
-                d = now - datetime.timedelta(days=6-i)
+        if group_by == "day":
+            num_days = (end_date - start_date).days
+            num_days = min(max(num_days, 0), 62)  # clamp to a reasonable max
+            for i in range(num_days + 1):
+                d = start_date + datetime.timedelta(days=i)
                 days.append(d.strftime("%b %d"))
-        elif time_range == "monthly":
-            start_date = now - datetime.timedelta(days=29)
-            group_by = "day"
-            for i in range(30):
-                d = now - datetime.timedelta(days=29-i)
-                days.append(d.strftime("%b %d"))
-        elif time_range == "custom" and particular_date_str:
-            try:
-                chosen_date = parse_date(particular_date_str)
-                if chosen_date:
-                    start_date = timezone.make_aware(datetime.datetime.combine(chosen_date, datetime.time.min))
-                    end_date = timezone.make_aware(datetime.datetime.combine(chosen_date, datetime.time.max))
-                    group_by = "hour"
-                    hours = [f"{h:02d}:00" for h in range(24)]
-            except Exception:
-                pass
+        elif group_by == "hour":
+            hours = [f"{h:02d}:00" for h in range(24)]
         
         # Determine base queryset and filter fields
         if query_type == "sales":
@@ -529,14 +754,8 @@ class AdminReportsViewSet(viewsets.ViewSet):
             date_field = "created_at"
             
         # Apply date filters
-        if start_date:
-            if group_by == "hour" and end_date:
-                qs = qs.filter(**{f"{date_field}__range": (start_date, end_date)})
-            else:
-                qs = qs.filter(**{f"{date_field}__gte": start_date})
-        else:
-            # Default yearly: current year
-            qs = qs.filter(**{f"{date_field}__year": now.year})
+        if start_date and end_date:
+            qs = qs.filter(**{f"{date_field}__range": (start_date, end_date)})
             
         # Group and annotate
         if group_by == "month":
