@@ -20,7 +20,7 @@ Design goals
 from django.contrib import admin
 from django.utils.html import format_html
 
-from .models import Order, OrderItem
+from .models import Order, OrderItem, VendorOrder
 
 
 # ===========================================================================
@@ -81,6 +81,23 @@ class OrderItemInline(admin.TabularInline):
     def display_name_col(self, obj):
         """Combine product + variant name for the inline table."""
         return obj.display_name
+
+
+class VendorOrderInline(admin.TabularInline):
+    model = VendorOrder
+    extra = 0
+    can_delete = False
+    readonly_fields = (
+        "vendor_order_number",
+        "vendor",
+        "status",
+        "subtotal",
+        "discount",
+        "tax",
+        "total_amount",
+    )
+    fields = readonly_fields
+    show_change_link = True
 
 
 # ===========================================================================
@@ -207,7 +224,7 @@ class OrderAdmin(admin.ModelAdmin):
         }),
     )
 
-    inlines = [OrderItemInline]
+    inlines = [OrderItemInline, VendorOrderInline]
 
     # ── Custom list columns ───────────────────────────────────────────────
 
@@ -344,3 +361,35 @@ class OrderItemAdmin(admin.ModelAdmin):
         Only superusers may do this, and only through the database.
         """
         return request.user.is_superuser
+
+
+@admin.register(VendorOrder)
+class VendorOrderAdmin(admin.ModelAdmin):
+    list_display = (
+        "vendor_order_number",
+        "master_order",
+        "vendor",
+        "status",
+        "total_amount",
+        "created_at",
+    )
+    list_filter = ("status", "vendor", "created_at")
+    search_fields = ("vendor_order_number", "master_order__order_number", "vendor__store_name")
+    readonly_fields = (
+        "master_order",
+        "vendor",
+        "vendor_order_number",
+        "status",
+        "subtotal",
+        "shipping_charge",
+        "discount",
+        "tax",
+        "total_amount",
+        "vendor_store_name_snapshot",
+        "vendor_business_name_snapshot",
+        "tracking_number",
+        "carrier_name",
+        "shipped_at",
+        "delivered_at",
+    )
+    ordering = ("-created_at",)

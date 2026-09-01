@@ -17,19 +17,20 @@ from .serializers import CartItemSerializer, CartItemInputSerializer
 
 def _cart_queryset():
     """
-    Base queryset used everywhere.
-
-    select_related("variant__product")
-        → fetches CartItem + ProductVariant + Product in ONE SQL JOIN.
-
-    prefetch_related("variant__images")
-        → fetches all ProductVariantImage rows for those variants in ONE extra
-          SQL query (not N queries), used by CartItemSerializer.get_image().
+    Base queryset for cart items optimized to fetch product, variant,
+    images, and vendor data in a minimal number of queries.
     """
     return (
         CartItem.objects
-        .select_related("variant__product")
-        .prefetch_related("variant__images")
+        .select_related(
+            "vendor_product__product",
+            "vendor_product__vendor",
+            "vendor_product_variant__product_variant",
+        )
+        .prefetch_related(
+            "vendor_product__product__variants__images",
+            "vendor_product_variant__product_variant__images",
+        )
     )
 
 
@@ -46,15 +47,6 @@ def _guest_cart(guest):
 def _get_or_create_guest(request):
     """
     Resolve (or create) a Guest from the incoming request.
-
-    Lookup order:
-      1. X-Guest-ID request header  (preferred for API clients / SPA)
-      2. guest_id cookie            (browser fallback)
-
-    If neither is present a fresh guest token is generated and a new
-    Guest row is created.
-
-    Returns: (Guest instance, guest_token string)
     """
     guest_token = (
         request.headers.get("X-Guest-ID")
@@ -75,16 +67,6 @@ def _get_or_create_guest(request):
 def _merge_guest_cart(user, guest_token):
     """
     Move all items from a guest cart into the authenticated user's cart.
-
-    Merge strategy:
-      • If the user already has the same variant → add quantities.
-      • Otherwise → transfer the guest row by reassigning user/guest FKs.
-
-    After merging, the Guest row itself is deleted (cascades to any
-    remaining items, though there should be none).
-
-    This function is intentionally silent on errors so a failed merge
-    never blocks the login flow.
     """
     if not guest_token:
         return
@@ -97,10 +79,17 @@ def _merge_guest_cart(user, guest_token):
     guest_items = _cart_queryset().filter(guest=guest)
 
     for item in guest_items:
-        existing = CartItem.objects.filter(
-            user=user,
-            variant=item.variant,
-        ).first()
+        if item.vendor_product_variant_id:
+            existing = CartItem.objects.filter(
+                user=user,
+                vendor_product_variant=item.vendor_product_variant,
+            ).first()
+        else:
+            existing = CartItem.objects.filter(
+                user=user,
+                vendor_product=item.vendor_product,
+                vendor_product_variant__isnull=True,
+            ).first()
 
         if existing:
             # Variant already in the user's cart — accumulate quantity.
@@ -113,18 +102,13 @@ def _merge_guest_cart(user, guest_token):
             item.guest = None
             item.save(update_fields=["user", "guest", "updated_at"])
 
-    # Clean up the guest session (any remaining items cascade-delete).
+    # Clean up the guest session
     guest.delete()
 
 
 def _build_cart_response(items, request, guest_token=None, status_code=status.HTTP_200_OK):
     """
     Shared response builder used by every view.
-
-    Computes cart_total (sum of all subtotals) server-side so the
-    frontend can display it without iterating over items.
-
-    Sets the guest_id cookie when guest_token is provided.
     """
     serializer = CartItemSerializer(items, many=True, context={"request": request})
     data = serializer.data
@@ -145,7 +129,7 @@ def _build_cart_response(items, request, guest_token=None, status_code=status.HT
             "guest_id",
             guest_token,
             max_age=365 * 24 * 60 * 60,   # 1 year
-            httponly=False,                 # JS-readable so the SPA can send it back
+            httponly=False,
             samesite="Lax",
         )
     return response
@@ -158,26 +142,12 @@ def _build_cart_response(items, request, guest_token=None, status_code=status.HT
 class CartAPIView(APIView):
     """
     GET  /cart/   → list all items in the caller's cart
-    POST /cart/   → add a variant to the cart (or increment quantity)
-
-    Authentication:
-      • JWT token present  → user cart
-      • No JWT token       → guest cart (X-Guest-ID header or guest_id cookie)
+    POST /cart/   → add a vendor product offer to the cart (or increment quantity)
     """
-    # Allow both authenticated and unauthenticated access.
-    # JWTAuthentication is attempted silently; request.user.is_authenticated
-    # tells us which path to take.
     authentication_classes = [JWTAuthentication]
     permission_classes = [AllowAny]
 
-    # ── GET ──────────────────────────────────────────────────
     def get(self, request):
-        """
-        Return the current cart contents.
-
-        For guests a new session is created if none exists, so the
-        response always includes a guest_id they can store.
-        """
         if request.user.is_authenticated:
             items = _user_cart(request.user)
             return _build_cart_response(items, request)
@@ -186,52 +156,51 @@ class CartAPIView(APIView):
             items = _guest_cart(guest)
             return _build_cart_response(items, request, guest_token=guest_token)
 
-    # ── POST ─────────────────────────────────────────────────
     def post(self, request):
-        """
-        Add a variant to the cart.
-
-        Request body:
-            { "variant": <int>, "quantity": <int> }
-
-        Business rules:
-          • If the same variant already exists in the cart, the quantity
-            is INCREMENTED (not replaced).  This matches typical UX where
-            clicking "Add to cart" twice adds two units.
-          • Stock validation: total cart quantity cannot exceed available stock.
-          • Inactive variants / parent products are rejected by the serializer.
-        """
         serializer = CartItemInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        variant  = serializer.validated_data["variant"]
+        vendor_product = serializer.validated_data.get("vendor_product")
+        vendor_product_variant = serializer.validated_data.get("vendor_product_variant")
         quantity = serializer.validated_data["quantity"]
+
+        # Determine stock levels and legacy variant
+        if vendor_product_variant:
+            stock = vendor_product_variant.stock
+            variant = vendor_product_variant.product_variant
+        else:
+            stock = vendor_product.stock
+            variant = None
 
         guest_token = None
 
+        # Build query parameters
+        kwargs = {}
         if request.user.is_authenticated:
-            cart_item, created = CartItem.objects.get_or_create(
-                user=request.user,
-                variant=variant,
-                defaults={"quantity": quantity},
-            )
+            kwargs["user"] = request.user
         else:
             guest, guest_token = _get_or_create_guest(request)
-            cart_item, created = CartItem.objects.get_or_create(
-                guest=guest,
-                variant=variant,
-                defaults={"quantity": quantity},
-            )
+            kwargs["guest"] = guest
+
+        if vendor_product_variant:
+            kwargs["vendor_product_variant"] = vendor_product_variant
+        else:
+            kwargs["vendor_product"] = vendor_product
+            kwargs["vendor_product_variant"] = None
+
+        cart_item, created = CartItem.objects.get_or_create(
+            **kwargs,
+            defaults={"quantity": quantity, "variant": variant, "vendor_product": vendor_product}
+        )
 
         if not created:
-            # Variant already in cart — increment, then validate stock.
             new_quantity = cart_item.quantity + quantity
-            if new_quantity > variant.stock:
+            if new_quantity > stock:
                 return Response(
                     {
                         "detail": (
                             f"Cannot add {quantity} more unit(s). "
-                            f"Only {variant.stock - cart_item.quantity} left in stock."
+                            f"Only {stock - cart_item.quantity} left in stock."
                         )
                     },
                     status=status.HTTP_400_BAD_REQUEST,
@@ -239,15 +208,13 @@ class CartAPIView(APIView):
             cart_item.quantity = new_quantity
             cart_item.save(update_fields=["quantity", "updated_at"])
         else:
-            # Freshly created item — still check stock.
-            if quantity > variant.stock:
+            if quantity > stock:
                 cart_item.delete()
                 return Response(
-                    {"detail": f"Only {variant.stock} unit(s) available in stock."},
+                    {"detail": f"Only {stock} unit(s) available in stock."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # Return the full updated cart (not just the single item).
         if request.user.is_authenticated:
             items = _user_cart(request.user)
         else:
@@ -258,31 +225,18 @@ class CartAPIView(APIView):
 
 class CartItemDetailAPIView(APIView):
     """
-    PATCH  /cart/<variant_id>/  → set the quantity of a specific item
-    DELETE /cart/<variant_id>/  → remove a specific item from the cart
-
-    The URL kwarg is `variant_id` (integer PK of ProductVariant).
+    PATCH  /cart/<cart_item_id>/  → set the quantity of a specific item
+    DELETE /cart/<cart_item_id>/  → remove a specific item from the cart
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [AllowAny]
 
-    def _resolve_cart_item(self, request, variant_id):
-        """
-        Locate the CartItem for the current owner + the given variant_id.
-        Returns (cart_item, guest_token) or raises Http404 / returns an
-        error Response for missing guest sessions.
-
-        Raises:
-            Http404 if the CartItem does not exist for this owner.
-        Returns:
-            (CartItem, guest_token_or_None)  on success
-            (None, Response)                 when the guest session is missing
-        """
+    def _resolve_cart_item(self, request, cart_item_id):
         if request.user.is_authenticated:
             cart_item = get_object_or_404(
                 CartItem,
                 user=request.user,
-                variant_id=variant_id,
+                id=cart_item_id,
             )
             return cart_item, None
         else:
@@ -300,26 +254,15 @@ class CartItemDetailAPIView(APIView):
             cart_item = get_object_or_404(
                 CartItem,
                 guest__guest_token=guest_token,
-                variant_id=variant_id,
+                id=cart_item_id,
             )
             return cart_item, guest_token
 
-    # ── PATCH ────────────────────────────────────────────────
-    def patch(self, request, variant_id):
-        """
-        Set (replace) the quantity of a cart item.
-
-        Request body:
-            { "quantity": <int> }
-
-        Unlike POST, this SETS the quantity rather than incrementing it —
-        useful for the quantity input field in the cart UI.
-        """
-        cart_item, guest_token_or_error = self._resolve_cart_item(request, variant_id)
+    def patch(self, request, cart_item_id):
+        cart_item, guest_token_or_error = self._resolve_cart_item(request, cart_item_id)
         if cart_item is None:
-            return guest_token_or_error  # error Response
+            return guest_token_or_error
 
-        # Validate incoming quantity.
         quantity = request.data.get("quantity")
         try:
             quantity = int(quantity)
@@ -331,17 +274,21 @@ class CartItemDetailAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Stock check against the variant's current stock level.
-        if quantity > cart_item.variant.stock:
+        # Get offer stock
+        if cart_item.vendor_product_variant_id:
+            stock = cart_item.vendor_product_variant.stock
+        else:
+            stock = cart_item.vendor_product.stock
+
+        if quantity > stock:
             return Response(
-                {"detail": f"Only {cart_item.variant.stock} unit(s) available in stock."},
+                {"detail": f"Only {stock} unit(s) available in stock."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         cart_item.quantity = quantity
         cart_item.save(update_fields=["quantity", "updated_at"])
 
-        # Return full updated cart.
         guest_token = None if request.user.is_authenticated else guest_token_or_error
         if request.user.is_authenticated:
             items = _user_cart(request.user)
@@ -350,17 +297,11 @@ class CartItemDetailAPIView(APIView):
 
         return _build_cart_response(items, request, guest_token=guest_token)
 
-    # ── DELETE ───────────────────────────────────────────────
-    def delete(self, request, variant_id):
-        """
-        Remove a variant from the cart entirely.
-        Returns the updated cart after removal.
-        """
-        cart_item, guest_token_or_error = self._resolve_cart_item(request, variant_id)
+    def delete(self, request, cart_item_id):
+        cart_item, guest_token_or_error = self._resolve_cart_item(request, cart_item_id)
         if cart_item is None:
-            return guest_token_or_error  # error Response
+            return guest_token_or_error
 
-        # Remember the owner before deletion for the follow-up query.
         owner_user  = cart_item.user
         owner_guest = cart_item.guest
         guest_token = None if request.user.is_authenticated else guest_token_or_error
@@ -373,7 +314,6 @@ class CartItemDetailAPIView(APIView):
             items = _guest_cart(owner_guest)
 
         response = _build_cart_response(items, request, guest_token=guest_token)
-        # Inject a success message into the existing response data.
         response.data["message"] = "Item removed from cart."
         return response
 
@@ -381,8 +321,6 @@ class CartItemDetailAPIView(APIView):
 class CartClearAPIView(APIView):
     """
     DELETE /cart/clear/  → remove ALL items from the caller's cart.
-
-    Useful for "Clear cart" buttons and post-checkout cleanup.
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [AllowAny]
@@ -410,17 +348,6 @@ class CartClearAPIView(APIView):
 class CartMergeAPIView(APIView):
     """
     POST /cart/merge/  → merge a guest cart into the authenticated user's cart.
-
-    Requires: JWT authentication (users must be logged in to merge).
-
-    Request body (any of the three sources is accepted):
-        { "guest_id": "<uuid>" }
-        OR  X-Guest-ID header
-        OR  guest_id cookie
-
-    Merge strategy (see _merge_guest_cart for detail):
-      • Same variant already in user cart → quantities are summed.
-      • New variant → guest row is transferred to the user.
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
@@ -442,6 +369,5 @@ class CartMergeAPIView(APIView):
         items = _user_cart(request.user)
         response = _build_cart_response(items, request)
         response.data["message"] = "Cart merged successfully."
-        # Clear the guest cookie now that the session has been consumed.
         response.delete_cookie("guest_id")
         return response

@@ -200,6 +200,13 @@ class Order(models.Model):
         ),
     )
 
+    idempotency_key = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Unique request identifier to prevent duplicate checkouts."
+    )
+
     # ───────────────────────────────────────────────────────────────────────
     # ADDRESS SNAPSHOT
     # Denormalised copy of the delivery address captured at checkout.
@@ -382,6 +389,12 @@ class Order(models.Model):
                 name="idx_order_payment",
             ),
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "idempotency_key"],
+                name="unique_user_checkout_idempotency"
+            )
+        ]
 
     # ───────────────────────────────────────────────────────────────────────
     # HELPERS
@@ -465,6 +478,97 @@ class Order(models.Model):
 
 
 # ===========================================================================
+# VENDOR ORDER
+# ===========================================================================
+class VendorOrder(models.Model):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    PROCESSING = "processing"
+    PACKED = "packed"
+    SHIPPED = "shipped"
+    DELIVERED = "delivered"
+    CANCELLED = "cancelled"
+
+    STATUS_CHOICES = [
+        (PENDING, "Pending"),
+        (CONFIRMED, "Confirmed"),
+        (PROCESSING, "Processing"),
+        (PACKED, "Packed"),
+        (SHIPPED, "Shipped"),
+        (DELIVERED, "Delivered"),
+        (CANCELLED, "Cancelled"),
+    ]
+
+    master_order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name="vendor_orders"
+    )
+    vendor = models.ForeignKey(
+        "vendors.Vendor",
+        on_delete=models.PROTECT,
+        related_name="vendor_orders"
+    )
+    vendor_order_number = models.CharField(
+        max_length=50,
+        unique=True,
+        db_index=True,
+        editable=False
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=PENDING,
+        db_index=True
+    )
+    
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    shipping_charge = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    discount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    tax = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    
+    vendor_store_name_snapshot = models.CharField(max_length=255, blank=True)
+    vendor_business_name_snapshot = models.CharField(max_length=255, blank=True)
+    
+    tracking_number = models.CharField(max_length=100, blank=True, default="")
+    carrier_name = models.CharField(max_length=100, blank=True, default="")
+    shipped_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Vendor Order"
+        verbose_name_plural = "Vendor Orders"
+
+    def _generate_vendor_order_number(self):
+        import uuid
+        from django.utils import timezone
+        date_str = timezone.now().strftime("%Y%m%d")
+        uid_chunk = uuid.uuid4().hex[:6].upper()
+        return f"VORD-{date_str}-{self.vendor_id}-{uid_chunk}"
+
+    def save(self, *args, **kwargs):
+        if not self.vendor_order_number:
+            self.vendor_order_number = self._generate_vendor_order_number()
+        
+        self.discount = max(Decimal("0.00"), self.discount)
+        self.total_amount = (
+            self.subtotal
+            + self.shipping_charge
+            + self.tax
+            - self.discount
+        )
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.vendor_order_number} ({self.get_status_display()})"
+
+
+# ===========================================================================
 # ORDER ITEM
 # ===========================================================================
 class OrderItem(models.Model):
@@ -493,6 +597,15 @@ class OrderItem(models.Model):
         # CASCADE: order items are meaningless without their parent order.
         related_name="items",
         help_text="The parent order this line item belongs to.",
+    )
+
+    vendor_order = models.ForeignKey(
+        VendorOrder,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="items",
+        help_text="The vendor sub-order this line item belongs to."
     )
 
     product = models.ForeignKey(
@@ -642,3 +755,19 @@ class OrderItem(models.Model):
             f"{self.order.order_number}  ·  "
             f"{self.display_name}  ×  {self.quantity}"
         )
+
+
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+@receiver(post_save, sender=Order)
+def propagate_order_status_to_vendors(sender, instance, created, **kwargs):
+    if instance.status == Order.CONFIRMED:
+        instance.vendor_orders.filter(status=VendorOrder.PENDING).update(status=VendorOrder.CONFIRMED)
+    elif instance.status == Order.CANCELLED:
+        from apps.orders.services import cancel_vendor_order_by_vendor
+        for sub_order in instance.vendor_orders.exclude(status=VendorOrder.CANCELLED):
+            try:
+                cancel_vendor_order_by_vendor(sub_order, instance.user)
+            except Exception:
+                pass

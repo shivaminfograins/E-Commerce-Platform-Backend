@@ -24,5 +24,5 @@ urlpatterns = [
     path("", CartAPIView.as_view(), name="cart-list-create"),
     path("clear/", CartClearAPIView.as_view(), name="cart-clear"),
     path("merge/", CartMergeAPIView.as_view(), name="cart-merge"),
-    path("<int:variant_id>/", CartItemDetailAPIView.as_view(), name="cart-item-detail"),
+    path("<int:cart_item_id>/", CartItemDetailAPIView.as_view(), name="cart-item-detail"),
 ]

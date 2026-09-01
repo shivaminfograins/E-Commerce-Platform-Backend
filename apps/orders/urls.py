@@ -41,6 +41,9 @@ from .views import (
     OrderListView,
     PlaceOrderView,
     DownloadInvoiceView,
+    CustomerOrderTrackingView,
+    CustomerCancelVendorOrderView,
+    CustomerOrderReturnsView,
 )
 
 app_name = "orders"
@@ -59,7 +62,7 @@ urlpatterns = [
         name="order-list",
     ),
 
-    # ── /api/orders/<pk>/  ────────────────────────────────────────────────
+    # ── Numeric PK routes (backward compatibility) ───────────────────────
     path(
         "<int:pk>/",
         OrderDetailView.as_view(),  # GET  — full detail with items
@@ -72,7 +75,44 @@ urlpatterns = [
     ),
     path(
         "<int:pk>/cancel/",
-        CancelOrderView.as_view(),  # PATCH — cancel + stock restore
+        CancelOrderView.as_view(),  # PATCH/POST — cancel + stock restore
         name="order-cancel",
+    ),
+    path(
+        "<int:pk>/tracking/",
+        CustomerOrderTrackingView.as_view(),
+        name="order-tracking",
+    ),
+    path(
+        "<int:pk>/returns/",
+        CustomerOrderReturnsView.as_view(),
+        name="order-returns",
+    ),
+
+    # ── String order_number routes ───────────────────────────────────────
+    path(
+        "<str:order_number>/tracking/",
+        CustomerOrderTrackingView.as_view(),
+        name="order-tracking-by-number",
+    ),
+    path(
+        "<str:order_number>/cancel/",
+        CancelOrderView.as_view(),
+        name="order-cancel-by-number",
+    ),
+    path(
+        "<str:order_number>/vendors/<str:vendor_order_number>/cancel/",
+        CustomerCancelVendorOrderView.as_view(),
+        name="vendor-order-cancel",
+    ),
+    path(
+        "<str:order_number>/returns/",
+        CustomerOrderReturnsView.as_view(),
+        name="order-returns-by-number",
+    ),
+    path(
+        "<str:order_number>/",
+        OrderDetailView.as_view(),
+        name="order-detail-by-number",
     ),
 ]

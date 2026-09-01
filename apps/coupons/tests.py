@@ -100,9 +100,19 @@ class CouponAPITests(APITestCase):
             price=Decimal("150.00"),
             stock=100
         )
+        
+        # Vendor offer setup for multi-vendor cart compatibility
+        from apps.vendors.models import Vendor, VendorProduct, VendorProductVariant
+        self.v_user = User.objects.create_user(username="coupon_v_user", email="coupon_v@example.com", password="Password123", role="vendor")
+        self.vendor = Vendor.objects.create(user=self.v_user, business_name="Coupon Vendor Corp", store_name="Coupon Store", business_email="coupon_v@example.com", business_phone="9876543210", status="APPROVED")
+        self.vp = VendorProduct.objects.create(vendor=self.vendor, product=self.product, price=Decimal("150.00"), stock=100, status="ACTIVE")
+        self.vpv = VendorProductVariant.objects.create(vendor_product=self.vp, product_variant=self.variant, price=Decimal("150.00"), stock=100, is_active=True)
+
         # Add to cart
         self.cart_item = CartItem.objects.create(
             user=self.user,
+            vendor_product=self.vp,
+            vendor_product_variant=self.vpv,
             variant=self.variant,
             quantity=1
         )
@@ -163,8 +173,16 @@ class CouponOrderIntegrationTests(APITestCase):
             price=Decimal("150.00"),
             stock=100
         )
+        from apps.vendors.models import Vendor, VendorProduct, VendorProductVariant
+        self.v_user = User.objects.create_user(username="coupon_v_user2", email="coupon_v2@example.com", password="Password123", role="vendor")
+        self.vendor = Vendor.objects.create(user=self.v_user, business_name="Coupon Vendor Corp 2", store_name="Coupon Store 2", business_email="coupon_v2@example.com", business_phone="9876543211", status="APPROVED")
+        self.vp = VendorProduct.objects.create(vendor=self.vendor, product=self.product, price=Decimal("150.00"), stock=100, status="ACTIVE")
+        self.vpv = VendorProductVariant.objects.create(vendor_product=self.vp, product_variant=self.variant, price=Decimal("150.00"), stock=100, is_active=True)
+
         self.cart_item = CartItem.objects.create(
             user=self.user,
+            vendor_product=self.vp,
+            vendor_product_variant=self.vpv,
             variant=self.variant,
             quantity=1
         )
@@ -258,12 +276,22 @@ class CouponEngineNewFeaturesTests(APITestCase):
         self.variant_novel = ProductVariant.objects.create(
             product=self.product_novel, name="Default", sku="NV-1", price=Decimal("50.00"), stock=100
         )
+
+        from apps.vendors.models import Vendor, VendorProduct, VendorProductVariant
+        self.v_user = User.objects.create_user(username="coupon_v_user3", email="coupon_v3@example.com", password="Password123", role="vendor")
+        self.vendor = Vendor.objects.create(user=self.v_user, business_name="Coupon Vendor Corp 3", store_name="Coupon Store 3", business_email="coupon_v3@example.com", business_phone="9876543212", status="APPROVED")
+        
+        self.vp_phone = VendorProduct.objects.create(vendor=self.vendor, product=self.product_phone, price=Decimal("100.00"), stock=100, status="ACTIVE")
+        self.vpv_phone = VendorProductVariant.objects.create(vendor_product=self.vp_phone, product_variant=self.variant_phone, price=Decimal("100.00"), stock=100, is_active=True)
+
+        self.vp_novel = VendorProduct.objects.create(vendor=self.vendor, product=self.product_novel, price=Decimal("50.00"), stock=100, status="ACTIVE")
+        self.vpv_novel = VendorProductVariant.objects.create(vendor_product=self.vp_novel, product_variant=self.variant_novel, price=Decimal("50.00"), stock=100, is_active=True)
         
         self.now = timezone.now()
 
     def test_coupon_max_purchase_amount(self):
         # Cart total: 100
-        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_phone, vendor_product_variant=self.vpv_phone, variant=self.variant_phone, quantity=1)
         coupon = Coupon.objects.create(
             code="MAX150",
             discount_type="fixed",
@@ -279,7 +307,7 @@ class CouponEngineNewFeaturesTests(APITestCase):
         self.assertFalse(response.data["success"])
 
     def test_coupon_first_order_only(self):
-        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_phone, vendor_product_variant=self.vpv_phone, variant=self.variant_phone, quantity=1)
         coupon = Coupon.objects.create(
             code="FIRSTONLY",
             discount_type="fixed",
@@ -314,8 +342,8 @@ class CouponEngineNewFeaturesTests(APITestCase):
 
     def test_coupon_category_scoped(self):
         # 1 Phone (100) + 1 Novel (50) = 150 subtotal
-        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
-        CartItem.objects.create(user=self.user, variant=self.variant_novel, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_phone, vendor_product_variant=self.vpv_phone, variant=self.variant_phone, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_novel, vendor_product_variant=self.vpv_novel, variant=self.variant_novel, quantity=1)
         
         coupon = Coupon.objects.create(
             code="ELEC10",
@@ -335,8 +363,8 @@ class CouponEngineNewFeaturesTests(APITestCase):
         self.assertEqual(float(response.data["discount_amount"]), 10.0)
 
     def test_coupon_product_scoped(self):
-        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
-        CartItem.objects.create(user=self.user, variant=self.variant_novel, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_phone, vendor_product_variant=self.vpv_phone, variant=self.variant_phone, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_novel, vendor_product_variant=self.vpv_novel, variant=self.variant_novel, quantity=1)
         
         coupon = Coupon.objects.create(
             code="PHONEONLY",
@@ -358,7 +386,7 @@ class CouponEngineNewFeaturesTests(APITestCase):
         self.assertEqual(float(response.data["discount_amount"]), 10.0)
 
     def test_coupon_product_combination(self):
-        CartItem.objects.create(user=self.user, variant=self.variant_phone, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_phone, vendor_product_variant=self.vpv_phone, variant=self.variant_phone, quantity=1)
         coupon = Coupon.objects.create(
             code="COMBO",
             discount_type="fixed",
@@ -378,7 +406,7 @@ class CouponEngineNewFeaturesTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         # Add Novel to cart
-        CartItem.objects.create(user=self.user, variant=self.variant_novel, quantity=1)
+        CartItem.objects.create(user=self.user, vendor_product=self.vp_novel, vendor_product_variant=self.vpv_novel, variant=self.variant_novel, quantity=1)
         response = self.client.post(url, {"code": "COMBO"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data["success"])

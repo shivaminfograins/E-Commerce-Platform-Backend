@@ -8,6 +8,8 @@ class NotificationSerializer(serializers.ModelSerializer):
         model = Notification
         fields = [
             "id",
+            "user",
+            "event_key",
             "title",
             "message",
             "notification_type",
@@ -21,7 +23,7 @@ class NotificationSerializer(serializers.ModelSerializer):
             "created_at_formatted",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "user", "event_key", "created_at", "updated_at"]
 
     def get_created_at_formatted(self, obj):
         # Return a simple ISO format or standard string representation

@@ -411,14 +411,20 @@ class AdminPanelPhase1Tests(APITestCase):
         order.refresh_from_db()
         self.assertEqual(order.status, "confirmed")
 
-        # 4. Cancel order and verify stock restored
+        # 4. Cancel order and verify stock restored via vendor inventory ledger
         self.assertEqual(self.variant.stock, 15)
         cancel_url = reverse("admin-orders-cancel", kwargs={"pk": order.id})
         cancel_res = self.client.patch(cancel_url)
         self.assertEqual(cancel_res.status_code, status.HTTP_200_OK)
         self.variant.refresh_from_db()
-        # Stock should increase from 15 to 16 since quantity is 1
-        self.assertEqual(self.variant.stock, 16)
+        # Master catalog stock remains unchanged at 15 (CRITICAL 2 compliance)
+        self.assertEqual(self.variant.stock, 15)
+        # Vendor offer stock restored
+        from apps.vendors.models import VendorProductVariant
+        vpv = VendorProductVariant.objects.filter(product_variant=self.variant).first()
+        if vpv:
+            vpv.refresh_from_db()
+            self.assertEqual(vpv.stock, 16)
         order.refresh_from_db()
         self.assertEqual(order.status, "cancelled")
 

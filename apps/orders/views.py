@@ -1,81 +1,40 @@
 """
 apps/orders/views.py
 ====================
-
-View map
---------
-
-  PlaceOrderView     POST   /api/orders/
-      Full checkout pipeline inside transaction.atomic().
-
-  OrderListView      GET    /api/orders/
-      Paginated, searchable, sortable list of the user's own orders.
-      Uses the lightweight OrderSummarySerializer (no nested items).
-
-  OrderDetailView    GET    /api/orders/<pk>/
-      Full order detail with nested line items.
-      Uses the full OrderSerializer.
-
-  CancelOrderView    PATCH  /api/orders/<pk>/cancel/
-      Idempotent cancellation with atomic stock restoration.
-
-──────────────────────────────────────────────────────────────────────
-Pagination  — PageNumberPagination (page / page_size query params)
-Ordering    — ?ordering=created_at | -created_at | total_amount | status
-Search      — ?search=<order_number_prefix>
-──────────────────────────────────────────────────────────────────────
-
-PlaceOrderView business logic
-------------------------------
-  1.  JWT authentication         → IsAuthenticated rejects 401 automatically
-  2.  Input validation           → PlaceOrderSerializer validates body
-  3.  Address ownership check    → Address.objects.get(pk=…, user=request.user)
-  4.  Cart fetch                 → select_related to avoid N+1; 400 if empty
-  5.  Stock validation (all)     → collect every OOS item before returning 400
-  6.  Price calculation          → Decimal arithmetic (no float rounding)
-  7.  transaction.atomic() ─────────────────────────────────────────────────
-  8.    Create Order             → snapshot address + price breakdown
-  9.    bulk_create OrderItems   → single INSERT; snapshot price, sku, image
-  10.   Decrement stock          → F("stock") - qty (SQL-level, race-free)
-  11.   Clear cart               → single DELETE
-  ───────────────────────────────────────────────────────────────────────────
-  12. Re-fetch order             → prefetch_related for nested serialisation
-  13. Return 201                 → full OrderSerializer response
-
-Error codes
------------
-  400 — bad input / empty cart / insufficient stock / wrong address
-  401 — unauthenticated
-  404 — order not found or belongs to another user (PATCH cancel / GET detail)
 """
 
 from decimal import Decimal
 
 from django.conf import settings
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.db.models import F, Q
 from rest_framework import generics, filters, status, serializers
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.shortcuts import get_object_or_404
+from django.core.exceptions import ValidationError
 
 from apps.accounts.models import Address
 from apps.cart.models import CartItem
 from apps.products.models import ProductVariant
 
-from .models import Order, OrderItem
+from .models import Order, OrderItem, VendorOrder
 from apps.payments.models import Transaction
 from apps.payments.services import RazorpayService
 from .serializers import (
     OrderSerializer,
     OrderSummarySerializer,
     PlaceOrderSerializer,
+    VendorOrderSerializer,
+    VendorOrderSummarySerializer,
 )
+from apps.vendors.permissions import IsApprovedVendor
 
 
 # ---------------------------------------------------------------------------
-# Business constants — override in settings.py for environment-specific values
+# Business constants
 # ---------------------------------------------------------------------------
 FREE_SHIPPING_THRESHOLD = Decimal(
     getattr(settings, "FREE_SHIPPING_THRESHOLD", "999.00")
@@ -84,7 +43,7 @@ SHIPPING_FEE = Decimal(
     getattr(settings, "SHIPPING_FEE", "99.00")
 )
 TAX_RATE = Decimal(
-    getattr(settings, "TAX_RATE", "0.00")   # e.g. "0.18" for 18 % GST
+    getattr(settings, "TAX_RATE", "0.00")
 )
 
 
@@ -92,31 +51,12 @@ TAX_RATE = Decimal(
 # PAGINATION
 # ===========================================================================
 class OrderPagination(PageNumberPagination):
-    """
-    Standard page-number pagination for the order list.
-
-    Query params
-    ------------
-      ?page=2            → go to page 2
-      ?page_size=5       → override default page size (capped at max_page_size)
-
-    The response envelope:
-      {
-        "count":    42,
-        "total_pages": 5,
-        "next":     "http://…/?page=3",
-        "previous": "http://…/?page=1",
-        "results":  [ … ]
-      }
-    """
-
-    page_size              = 10    # default items per page
+    page_size              = 10
     page_size_query_param  = "page_size"
-    max_page_size          = 50    # hard cap so clients cannot request 10 000 rows
+    max_page_size          = 50
     page_query_param       = "page"
 
     def get_paginated_response(self, data):
-        """Adds total_pages to the standard DRF envelope."""
         return Response(
             {
                 "success":     True,
@@ -133,25 +73,9 @@ class OrderPagination(PageNumberPagination):
 # POST /api/orders/
 # ===========================================================================
 class PlaceOrderView(APIView):
-    """
-    Checkout endpoint.
-
-    Creates an Order from the authenticated user's active cart in a single
-    atomic database transaction.  Every step either succeeds completely or
-    the entire operation is rolled back — no partial orders, no orphaned
-    stock decrements.
-
-    Method  : POST
-    Auth    : JWT Bearer (IsAuthenticated)
-    Body    : { address, payment_method, coupon_code?, notes? }
-    Returns : 201 + full OrderSerializer on success
-              400 + structured errors on any validation / business failure
-    """
-
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-
         # ── Step 1: Validate request body ─────────────────────────────
         input_serializer = PlaceOrderSerializer(data=request.data)
         if not input_serializer.is_valid():
@@ -165,11 +89,23 @@ class PlaceOrderView(APIView):
             )
 
         data = input_serializer.validated_data
+        idempotency_key = data.get("idempotency_key", "")
+
+        # ── User-Scoped Idempotency Read ──────────────────────────────
+        if idempotency_key:
+            existing_order = Order.objects.filter(user=request.user, idempotency_key=idempotency_key).first()
+            if existing_order:
+                serializer = OrderSerializer(existing_order, context={"request": request})
+                return Response(
+                    {
+                        "success": True,
+                        "message": "Order placed successfully (retrieved from cache).",
+                        "order":   serializer.data,
+                    },
+                    status=status.HTTP_201_CREATED,
+                )
 
         # ── Step 2: Validate address ownership ───────────────────────
-        # A single get() that checks both PK and owner prevents:
-        #   • Address enumeration attacks (returns 400 not 403/404)
-        #   • Using another user's address ID
         try:
             address = Address.objects.get(
                 pk=data["address"],
@@ -179,53 +115,60 @@ class PlaceOrderView(APIView):
             return Response(
                 {
                     "success": False,
-                    "message": (
-                        "Address not found. Please use a valid address "
-                        "from your account."
-                    ),
+                    "message": "Address not found. Please use a valid address from your account.",
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         # ── Step 3: Fetch cart ────────────────────────────────────────
-        # select_related pulls variant + product + product images in a
-        # single SQL JOIN, so the stock-check and image-URL resolution
-        # loops below run without any additional queries.
         cart_items = list(
             CartItem.objects
             .filter(user=request.user)
             .select_related(
-                "variant__product",
+                "vendor_product__product",
+                "vendor_product__vendor",
+                "vendor_product_variant__product_variant",
             )
-            .prefetch_related("variant__images")
         )
 
         if not cart_items:
             return Response(
                 {
                     "success": False,
-                    "message": (
-                        "Your cart is empty. Add items before placing an order."
-                    ),
+                    "message": "Your cart is empty. Add items before placing an order.",
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ── Step 4: Stock validation ──────────────────────────────────
-        # Collect ALL stock failures before returning so the customer
-        # can fix every problem in one go instead of discovering them
-        # one at a time on successive requests.
+        # ── Step 4: Strict offer & stock validation ───────────────────
         stock_errors = []
         for item in cart_items:
-            if item.quantity > item.variant.stock:
-                v = item.variant
+            # Model validation
+            try:
+                item.clean()
+            except Exception as e:
+                stock_errors.append({"detail": str(e)})
+                continue
+
+            # Check stock
+            if item.vendor_product_variant_id:
+                available = item.vendor_product_variant.stock
+                name = f"{item.vendor_product.product.name} — {item.vendor_product_variant.product_variant.name}"
+                sku = item.vendor_product_variant.vendor_sku or (item.vendor_product_variant.product_variant.sku if item.vendor_product_variant.product_variant else "")
+            else:
+                available = item.vendor_product.stock
+                name = item.vendor_product.product.name
+                v_first = item.vendor_product.product.variants.first()
+                sku = v_first.sku if (v_first and v_first.sku) else (item.vendor_product.product.slug or "")
+
+            if item.quantity > available:
                 stock_errors.append(
                     {
-                        "variant_id":   v.id,
-                        "variant_name": f"{v.product.name} — {v.name}",
-                        "sku":          v.sku,
+                        "variant_id": item.vendor_product_variant_id or item.vendor_product_id,
+                        "variant_name": name,
+                        "sku":          sku,
                         "requested":    item.quantity,
-                        "available":    v.stock,
+                        "available":    available,
                     }
                 )
 
@@ -233,18 +176,15 @@ class PlaceOrderView(APIView):
             return Response(
                 {
                     "success": False,
-                    "message": (
-                        "One or more items in your cart have insufficient stock."
-                    ),
+                    "message": "One or more items in your cart are invalid or have insufficient stock.",
                     "stock_errors": stock_errors,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         # ── Step 5: Price calculation ─────────────────────────────────
-        # Decimal throughout — never float — to avoid rounding errors.
         subtotal = sum(
-            item.variant.price * item.quantity
+            (item.vendor_product_variant.price if item.vendor_product_variant_id else item.vendor_product.price) * item.quantity
             for item in cart_items
         )
         shipping_charge = (
@@ -252,9 +192,9 @@ class PlaceOrderView(APIView):
             if subtotal >= FREE_SHIPPING_THRESHOLD
             else SHIPPING_FEE
         )
-        tax      = (subtotal * TAX_RATE).quantize(Decimal("0.01"))
+        tax = (subtotal * TAX_RATE).quantize(Decimal("0.01"))
         
-        # ── Coupon Validation ──────────────────────────────────────────
+        # Coupon validation
         discount = Decimal("0.00")
         coupon_code = data.get("coupon_code", "").upper().strip()
         coupon = None
@@ -280,147 +220,123 @@ class PlaceOrderView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # ── Steps 6–10: Atomic database operations ────────────────────
-        with transaction.atomic():
+        # ── Step 6: Atomic DB checkouts with user-scoped uniqueness ───
+        try:
+            with transaction.atomic():
+                order = Order.objects.create(
+                    user=request.user,
+                    address=address,
+                    snapshot_full_name=address.full_name,
+                    snapshot_phone=address.phone,
+                    snapshot_address_line_1=address.address_line_1,
+                    snapshot_address_line_2=address.address_line_2,
+                    snapshot_landmark=address.landmark,
+                    snapshot_city=address.city,
+                    snapshot_state=address.state,
+                    snapshot_country=address.country,
+                    snapshot_postal_code=address.postal_code,
+                    status=Order.PENDING,
+                    payment_method=data["payment_method"],
+                    payment_status=Order.PAYMENT_PENDING,
+                    subtotal=subtotal,
+                    shipping_charge=shipping_charge,
+                    discount=discount,
+                    tax=tax,
+                    total_amount=subtotal + shipping_charge + tax - discount,
+                    coupon=coupon,
+                    coupon_code=coupon.code if coupon else "",
+                    notes=data.get("notes", ""),
+                    idempotency_key=idempotency_key or None,
+                )
 
-            # ── Step 6: Create Order ──────────────────────────────────
-            # order_number is auto-generated in Order.save() via UUID4.
-            # total_amount is also recomputed in Order.save(), but we
-            # pass it explicitly as an extra safety net.
-            order = Order.objects.create(
-                user=request.user,
-                address=address,
-                # ── Address snapshot ───────────────────────────────────
-                snapshot_full_name=address.full_name,
-                snapshot_phone=address.phone,
-                snapshot_address_line_1=address.address_line_1,
-                snapshot_address_line_2=address.address_line_2,
-                snapshot_landmark=address.landmark,
-                snapshot_city=address.city,
-                snapshot_state=address.state,
-                snapshot_country=address.country,
-                snapshot_postal_code=address.postal_code,
-                # ── Status ────────────────────────────────────────────
-                status=Order.PENDING,
-                payment_method=data["payment_method"],
-                # COD is automatically "paid" (payment happens on delivery;
-                # all online gateway methods start as pending until webhook).
-                payment_status=(
-                    Order.PAYMENT_PAID
-                    if data["payment_method"] == Order.COD
-                    else Order.PAYMENT_PENDING
-                ),
-                # ── Price ─────────────────────────────────────────────
-                subtotal=subtotal,
-                shipping_charge=shipping_charge,
-                discount=discount,
-                tax=tax,
-                total_amount=subtotal + shipping_charge + tax - discount,
-                # ── Misc ──────────────────────────────────────────────
-                coupon=coupon,
-                coupon_code=coupon.code if coupon else "",
-                notes=data.get("notes", ""),
+                if coupon:
+                    from apps.coupons.models import CouponUsage
+                    CouponUsage.objects.create(
+                        coupon=coupon,
+                        user=request.user,
+                        order=order
+                    )
+                    Coupon.objects.filter(pk=coupon.pk).update(usage_count=F("usage_count") + 1)
+
+                # Create pending transaction record
+                trx_payment_method = Transaction.COD if data["payment_method"] == Order.COD else Transaction.RAZORPAY
+                trx = Transaction.objects.create(
+                    order=order,
+                    payment_method=trx_payment_method,
+                    status=Transaction.PENDING,
+                    amount=order.total_amount
+                )
+
+                # Multi-vendor splitting & stock reservation
+                from apps.orders.services import create_split_vendor_orders
+                create_split_vendor_orders(order, cart_items, request.user)
+
+                # Clear cart
+                CartItem.objects.filter(user=request.user).delete()
+
+                from apps.notifications.services import NotificationService
+                event_key = f"ORDER_PLACED:{order.order_number}"
+                NotificationService.create_notification_on_commit(
+                    user=request.user,
+                    notification_type="ORDER",
+                    title="Order Placed",
+                    message=f"Your order {order.order_number} has been placed successfully.",
+                    event_key=event_key,
+                    reference_type="ORDER",
+                    reference_id=order.order_number,
+                )
+
+        except IntegrityError:
+            # Handle duplicate key
+            existing_order = Order.objects.get(user=request.user, idempotency_key=idempotency_key)
+            serializer = OrderSerializer(existing_order, context={"request": request})
+            return Response(
+                {
+                    "success": True,
+                    "message": "Order placed successfully (retrieved from cache).",
+                    "order":   serializer.data,
+                },
+                status=status.HTTP_201_CREATED,
             )
 
-            # Record Coupon Usage
-            if coupon:
-                from apps.coupons.models import CouponUsage
-                CouponUsage.objects.create(
-                    coupon=coupon,
-                    user=request.user,
-                    order=order
-                )
-                Coupon.objects.filter(pk=coupon.pk).update(usage_count=F("usage_count") + 1)
-
-            # ── Razorpay Order Creation ──────────────────────────────
-            if data["payment_method"] == Order.RAZORPAY:
+        # ── Step 7: External Gateway Initialization OUTSIDE DB Transaction ──
+        if data["payment_method"] == Order.RAZORPAY:
+            try:
                 rzp_response = RazorpayService.create_razorpay_order(
                     order_number=order.order_number,
                     amount=order.total_amount
                 )
-                if not rzp_response["success"]:
-                    # Rollback transaction cleanly
-                    raise serializers.ValidationError(
-                        f"Payment gateway initialization failed: {rzp_response.get('error')}"
-                    )
-                
-                # Record transaction registry
-                Transaction.objects.create(
-                    order=order,
-                    payment_method=Transaction.RAZORPAY,
-                    status=Transaction.PENDING,
-                    amount=order.total_amount,
-                    razorpay_order_id=rzp_response["id"],
-                    raw_response=rzp_response["raw_response"]
-                )
-            elif data["payment_method"] == Order.COD:
-                # Record COD transaction Registry
-                Transaction.objects.create(
-                    order=order,
-                    payment_method=Transaction.COD,
-                    status=Transaction.SUCCESS,
-                    amount=order.total_amount
-                )
+                if not rzp_response.get("success"):
+                    raise Exception(rzp_response.get("error", "Gateway error"))
 
-            # ── Step 7: Create OrderItems (bulk) ──────────────────────
-            # bulk_create → single INSERT statement.
-            # IMPORTANT: bulk_create bypasses Model.save(), so we compute
-            # `total` (price × quantity) manually here.
-            order_items_to_create = []
-            for item in cart_items:
-                v = item.variant
-                p = v.product
-
-                # Resolve image URL from the pre-fetched related manager.
-                # all() iterates the in-memory prefetch cache — zero extra DB queries.
-                image_url = ""
-                first_image = v.images.first()
-                if first_image and first_image.image:
+                trx.razorpay_order_id = rzp_response["id"]
+                trx.raw_response = rzp_response.get("raw_response", {})
+                trx.save(update_fields=["razorpay_order_id", "raw_response", "updated_at"])
+            except Exception as rzp_err:
+                # Handle Gateway Initialization Failure: Cancel sub-orders and release stock safely
+                from apps.orders.services import cancel_vendor_order_by_vendor
+                for sub_order in order.vendor_orders.all():
                     try:
-                        image_url = request.build_absolute_uri(
-                            first_image.image.url
-                        )
+                        cancel_vendor_order_by_vendor(sub_order, request.user)
                     except Exception:
-                        image_url = ""
+                        pass
 
-                order_items_to_create.append(
-                    OrderItem(
-                        order=order,
-                        # Live FK references (nullable SET_NULL catalogue links)
-                        product=p,
-                        variant=v,
-                        # Immutable purchase snapshot
-                        product_name=p.name,
-                        variant_name=v.name,
-                        sku=v.sku,
-                        product_image=image_url,
-                        # Financial snapshot
-                        price=v.price,
-                        quantity=item.quantity,
-                        total=v.price * item.quantity,
-                    )
+                trx.status = Transaction.FAILED
+                trx.error_message = str(rzp_err)
+                trx.save(update_fields=["status", "error_message", "updated_at"])
+
+                order.status = Order.CANCELLED
+                order.payment_status = Order.PAYMENT_FAILED
+                order.save(update_fields=["status", "payment_status", "updated_at"])
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Payment gateway initialization failed: {rzp_err}",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            OrderItem.objects.bulk_create(order_items_to_create)
-
-            # ── Step 8: Atomically decrement variant stock ────────────
-            # F("stock") - qty translates to:
-            #   UPDATE products_productvariant SET stock = stock - %s WHERE id = %s
-            # This is a DB-level atomic operation — no read-modify-write
-            # race condition even under concurrent high-traffic checkouts.
-            for item in cart_items:
-                ProductVariant.objects.filter(pk=item.variant_id).update(
-                    stock=F("stock") - item.quantity
-                )
-
-            # ── Step 9: Clear user's cart ─────────────────────────────
-            # Single DELETE — the cart is cleared only inside the
-            # transaction, so it stays intact if any prior step fails.
-            CartItem.objects.filter(user=request.user).delete()
-
-        # ── Step 10: Re-fetch and return ──────────────────────────────
-        # Re-fetch the newly created order with all relations prefetched
-        # so the serializer can render nested items without N+1 queries.
         order_fresh = (
             Order.objects
             .prefetch_related(
@@ -449,74 +365,15 @@ class PlaceOrderView(APIView):
 # GET /api/orders/
 # ===========================================================================
 class OrderListView(generics.ListAPIView):
-    """
-    Returns a paginated, searchable, sortable list of the requesting
-    user's own orders.  Uses OrderSummarySerializer (no nested items)
-    for bandwidth efficiency.
-
-    Method  : GET
-    Auth    : JWT Bearer (IsAuthenticated)
-    Returns : 200 + paginated order list
-
-    Query parameters
-    ----------------
-      ?page=<n>              Page number (default 1)
-      ?page_size=<n>         Items per page (default 10, max 50)
-
-      ?search=<term>         Searches:
-                               • order_number (icontains)
-                               • status       (icontains)
-
-      ?ordering=<field>      Sort ascending; prefix with '-' for descending.
-                             Allowed fields:
-                               created_at      (newest first by default)
-                               total_amount
-                               status
-                               payment_status
-
-    Example
-    -------
-      GET /api/orders/?search=ORD-2026&ordering=-total_amount&page=1
-    """
-
     permission_classes  = [IsAuthenticated]
     serializer_class    = OrderSummarySerializer
     pagination_class    = OrderPagination
-
-    # DRF filter backends wired in here — no extra packages required for
-    # SearchFilter / OrderingFilter (they ship with DRF).
     filter_backends     = [filters.SearchFilter, filters.OrderingFilter]
-
-    # SearchFilter: applies icontains across the listed fields.
-    # A single ?search=X queries all fields with OR logic.
-    search_fields       = [
-        "order_number",   # primary search: "ORD-20260706-A1B2"
-        "status",         # secondary: "pending", "shipped" …
-    ]
-
-    # OrderingFilter: only the fields listed here can be used in ?ordering=
-    # so clients cannot sort by arbitrary/expensive computed fields.
-    ordering_fields     = [
-        "created_at",
-        "total_amount",
-        "status",
-        "payment_status",
-    ]
-
-    # Default ordering — newest orders first
+    search_fields       = ["order_number", "status"]
+    ordering_fields     = ["created_at", "total_amount", "status", "payment_status"]
     ordering            = ["-created_at"]
 
     def get_queryset(self):
-        """
-        Scoped strictly to the requesting user's orders.
-
-        Uses select_related("address") to avoid a per-row JOIN for the
-        address FK (even though we display the snapshot fields, Django
-        may touch the FK if admin tools or other serializers reference it).
-        prefetch_related("items") so item_count (a property on Order that
-        calls self.items.count()) uses the pre-fetched cache instead of
-        issuing one COUNT query per order row.
-        """
         return (
             Order.objects
             .filter(user=self.request.user)
@@ -525,19 +382,12 @@ class OrderListView(generics.ListAPIView):
         )
 
     def list(self, request, *args, **kwargs):
-        """
-        Override list() to wrap the paginated response in a consistent
-        {success, message, …} envelope matching the rest of the API.
-        The actual pagination envelope is produced by OrderPagination.
-        """
         queryset = self.filter_queryset(self.get_queryset())
-
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
             return self.get_paginated_response(serializer.data)
 
-        # Fallback if pagination is disabled (shouldn't happen with this config)
         serializer = self.get_serializer(queryset, many=True)
         return Response(
             {
@@ -552,22 +402,6 @@ class OrderListView(generics.ListAPIView):
 # GET /api/orders/<pk>/
 # ===========================================================================
 class OrderDetailView(generics.RetrieveAPIView):
-    """
-    Returns full detail of a single order including all nested line items,
-    the complete address snapshot, and the full price breakdown.
-
-    Method  : GET
-    Auth    : JWT Bearer (IsAuthenticated)
-    Returns : 200 + full OrderSerializer
-              404 if the PK does not exist OR belongs to another user
-
-    Security note
-    -------------
-    The queryset is filtered to user=request.user so PK enumeration is
-    safe — a user who guesses order PK 9999 gets a 404, not a 403, which
-    reveals no information about whose order it is.
-    """
-
     permission_classes = [IsAuthenticated]
     serializer_class   = OrderSerializer
 
@@ -580,8 +414,21 @@ class OrderDetailView(generics.RetrieveAPIView):
                 "items",
                 "items__product",
                 "items__variant",
+                "vendor_orders",
+                "vendor_orders__vendor",
+                "vendor_orders__items",
             )
         )
+
+    def get_object(self):
+        queryset = self.get_queryset()
+        lookup = self.kwargs.get("order_number") or self.kwargs.get("pk")
+        if str(lookup).isdigit():
+            obj = get_object_or_404(queryset, pk=int(lookup))
+        else:
+            obj = get_object_or_404(queryset, order_number=lookup)
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     def retrieve(self, request, *args, **kwargs):
         instance   = self.get_object()
@@ -595,87 +442,62 @@ class OrderDetailView(generics.RetrieveAPIView):
 
 
 # ===========================================================================
-# PATCH /api/orders/<pk>/cancel/
+# POST / PATCH /api/orders/<order_number>/cancel/
 # ===========================================================================
 class CancelOrderView(APIView):
-    """
-    Cancels the order identified by <pk> and atomically restores
-    the stock for every line item.
-
-    Why PATCH (not POST or DELETE)?
-    --------------------------------
-    PATCH semantics are correct here: we are partially updating the order
-    resource (changing its `status` field from any pre-delivered state to
-    "cancelled").  POST would imply creating a new resource; DELETE would
-    imply removing the record (we keep it for audit history).
-
-    Method  : PATCH
-    Auth    : JWT Bearer (IsAuthenticated)
-    Body    : {} — no payload required
-    Returns : 200 + updated OrderSerializer on success
-              400 + message if the order is already delivered / cancelled / refunded
-              404 if the order does not exist or belongs to another user
-
-    Idempotency note
-    ----------------
-    Cancelling an already-cancelled order returns 400, NOT 200.
-    This is intentional: a 200 would make downstream webhook consumers
-    think a new cancellation event occurred, potentially triggering a
-    second refund.  The 400 signals "nothing changed".
-
-    Stock restoration
-    -----------------
-    Uses F("stock") + item.quantity (SQL-level UPDATE) so stock is restored
-    atomically — no read-modify-write race condition under concurrent requests.
-    """
-
     permission_classes = [IsAuthenticated]
 
-    def patch(self, request, pk):
+    def post(self, request, pk=None, order_number=None):
+        return self._cancel(request, pk, order_number)
 
-        # ── 1. Ownership-checked lookup ───────────────────────────────
-        # 404 hides whether the order exists at all for non-owners.
+    def patch(self, request, pk=None, order_number=None):
+        return self._cancel(request, pk, order_number)
+
+    def _cancel(self, request, pk=None, order_number=None):
+        lookup = order_number or pk
         try:
-            order = (
-                Order.objects
-                .prefetch_related("items__variant")
-                .get(pk=pk, user=request.user)
-            )
+            if str(lookup).isdigit():
+                order = Order.objects.prefetch_related("vendor_orders").get(pk=int(lookup), user=request.user)
+            else:
+                order = Order.objects.prefetch_related("vendor_orders").get(order_number=lookup, user=request.user)
         except Order.DoesNotExist:
             return Response(
                 {"success": False, "message": "Order not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # ── 2. Business rule check ────────────────────────────────────
         if not order.is_cancellable:
             return Response(
                 {
                     "success": False,
-                    "message": (
-                        f"This order cannot be cancelled. "
-                        f"Current status: '{order.get_status_display()}'."
-                    ),
+                    "message": f"This order cannot be cancelled. Current status: '{order.get_status_display()}'.",
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ── 3. Atomic cancellation + stock restore ────────────────────
+        from apps.orders.services import cancel_vendor_order_by_vendor
         with transaction.atomic():
-            for item in order.items.all():
-                # Guard against variant being NULL (catalogue entry deleted)
-                if item.variant_id:
-                    ProductVariant.objects.filter(pk=item.variant_id).update(
-                        stock=F("stock") + item.quantity
-                    )
+            for sub_order in order.vendor_orders.exclude(status=VendorOrder.CANCELLED):
+                try:
+                    cancel_vendor_order_by_vendor(sub_order, request.user)
+                except ValidationError as e:
+                    return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-            # update_fields limits the UPDATE to exactly these two columns
-            # for efficiency and to avoid overwriting concurrent changes to
-            # other fields (e.g. payment_status updated by a webhook).
             order.status = Order.CANCELLED
             order.save(update_fields=["status", "updated_at"])
 
-        # ── 4. Return the updated order ───────────────────────────────
+            from apps.notifications.services import NotificationService
+            event_key = f"ORDER_CANCELLED:{order.order_number}"
+            NotificationService.create_notification_on_commit(
+                user=request.user,
+                notification_type="ORDER",
+                title="Order Cancelled",
+                message=f"Order {order.order_number} has been cancelled successfully.",
+                event_key=event_key,
+                reference_type="ORDER",
+                reference_id=order.order_number,
+            )
+
         serializer = OrderSerializer(order, context={"request": request})
         return Response(
             {
@@ -687,11 +509,164 @@ class CancelOrderView(APIView):
         )
 
 
+# ===========================================================================
+# GET /api/orders/<order_number>/tracking/
+# ===========================================================================
+class CustomerOrderTrackingView(APIView):
+    """
+    GET /api/orders/<order_number>/tracking/
+    Returns independent shipment tracking details and derived status timelines for each VendorOrder.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, order_number=None, pk=None):
+        lookup = order_number or pk
+        if str(lookup).isdigit():
+            order = get_object_or_404(Order.objects.prefetch_related("vendor_orders", "vendor_orders__vendor"), user=request.user, pk=int(lookup))
+        else:
+            order = get_object_or_404(Order.objects.prefetch_related("vendor_orders", "vendor_orders__vendor"), user=request.user, order_number=lookup)
+
+        shipments = []
+        for sub in order.vendor_orders.all():
+            timeline = [
+                {
+                    "status": VendorOrder.CONFIRMED,
+                    "label": "Order Confirmed",
+                    "completed": sub.status in [VendorOrder.CONFIRMED, VendorOrder.PROCESSING, VendorOrder.PACKED, VendorOrder.SHIPPED, VendorOrder.DELIVERED],
+                    "timestamp": sub.created_at.isoformat() if sub.created_at else None,
+                },
+                {
+                    "status": VendorOrder.PROCESSING,
+                    "label": "Processing",
+                    "completed": sub.status in [VendorOrder.PROCESSING, VendorOrder.PACKED, VendorOrder.SHIPPED, VendorOrder.DELIVERED],
+                    "timestamp": None,
+                },
+                {
+                    "status": VendorOrder.PACKED,
+                    "label": "Packed",
+                    "completed": sub.status in [VendorOrder.PACKED, VendorOrder.SHIPPED, VendorOrder.DELIVERED],
+                    "timestamp": None,
+                },
+                {
+                    "status": VendorOrder.SHIPPED,
+                    "label": "Shipped",
+                    "completed": sub.status in [VendorOrder.SHIPPED, VendorOrder.DELIVERED],
+                    "timestamp": sub.shipped_at.isoformat() if sub.shipped_at else None,
+                },
+                {
+                    "status": VendorOrder.DELIVERED,
+                    "label": "Delivered",
+                    "completed": sub.status == VendorOrder.DELIVERED,
+                    "timestamp": sub.delivered_at.isoformat() if sub.delivered_at else None,
+                },
+            ]
+            if sub.status == VendorOrder.CANCELLED:
+                timeline.append({
+                    "status": VendorOrder.CANCELLED,
+                    "label": "Cancelled",
+                    "completed": True,
+                    "timestamp": sub.updated_at.isoformat() if sub.updated_at else None,
+                })
+
+            shipments.append({
+                "vendor_order_number": sub.vendor_order_number,
+                "vendor_name": sub.vendor_store_name_snapshot or sub.vendor.store_name,
+                "status": sub.status,
+                "status_display": sub.get_status_display(),
+                "carrier_name": sub.carrier_name,
+                "tracking_number": sub.tracking_number,
+                "shipped_at": sub.shipped_at.isoformat() if sub.shipped_at else None,
+                "delivered_at": sub.delivered_at.isoformat() if sub.delivered_at else None,
+                "timeline": timeline,
+            })
+
+        return Response({
+            "success": True,
+            "order_number": order.order_number,
+            "master_status": order.status,
+            "shipments": shipments,
+        }, status=status.HTTP_200_OK)
+
+
+# ===========================================================================
+# POST /api/orders/<order_number>/vendors/<vendor_order_number>/cancel/
+# ===========================================================================
+class CustomerCancelVendorOrderView(APIView):
+    """
+    POST /api/orders/<order_number>/vendors/<vendor_order_number>/cancel/
+    Cancels a specific vendor sub-order belonging to the authenticated customer's order.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, order_number=None, vendor_order_number=None):
+        lookup = order_number
+        if str(lookup).isdigit():
+            order = get_object_or_404(Order, user=request.user, pk=int(lookup))
+        else:
+            order = get_object_or_404(Order, user=request.user, order_number=lookup)
+
+        vendor_order = get_object_or_404(VendorOrder, master_order=order, vendor_order_number=vendor_order_number)
+
+        from apps.orders.services import cancel_vendor_order_by_vendor
+        try:
+            cancel_vendor_order_by_vendor(vendor_order, request.user)
+        except ValidationError as e:
+            return Response({"success": False, "message": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.notifications.services import NotificationService
+        event_key = f"VENDOR_ORDER_CANCELLED:{vendor_order.vendor_order_number}"
+        NotificationService.create_notification_on_commit(
+            user=request.user,
+            notification_type="ORDER",
+            title="Vendor Order Cancelled",
+            message=f"Sub-order {vendor_order.vendor_order_number} has been cancelled successfully.",
+            event_key=event_key,
+            reference_type="VENDOR_ORDER",
+            reference_id=vendor_order.vendor_order_number,
+        )
+
+        serializer = VendorOrderSerializer(vendor_order, context={"request": request})
+        return Response({
+            "success": True,
+            "message": "Sub-order cancelled successfully.",
+            "order": serializer.data,
+        }, status=status.HTTP_200_OK)
+
+
+# ===========================================================================
+# GET /api/orders/<order_number>/returns/
+# ===========================================================================
+class CustomerOrderReturnsView(APIView):
+    """
+    GET /api/orders/<order_number>/returns/
+    Returns return requests associated with the authenticated customer's order.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, order_number=None, pk=None):
+        lookup = order_number or pk
+        if str(lookup).isdigit():
+            order = get_object_or_404(Order, user=request.user, pk=int(lookup))
+        else:
+            order = get_object_or_404(Order, user=request.user, order_number=lookup)
+
+        from apps.returns.models import ReturnRequest
+        from apps.returns.serializers import ReturnRequestSerializer
+        returns_qs = ReturnRequest.objects.filter(order=order, customer=request.user).select_related(
+            "order", "vendor_order", "order_item", "vendor", "refund"
+        )
+        serializer = ReturnRequestSerializer(returns_qs, many=True)
+        return Response({
+            "success": True,
+            "order_number": order.order_number,
+            "returns": serializer.data,
+        }, status=status.HTTP_200_OK)
+
+
+# ===========================================================================
+# DOWNLOAD INVOICE
+# ===========================================================================
 class DownloadInvoiceView(APIView):
-    """
-    Generates a professional, legally-compliant PDF Tax Invoice
-    and returns it as a binary PDF attachment.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
@@ -722,7 +697,6 @@ class DownloadInvoiceView(APIView):
 
         styles = getSampleStyleSheet()
         
-        # Define clean, professional text styles
         title_style = ParagraphStyle(
             "InvoiceTitle",
             parent=styles["Normal"],
@@ -750,15 +724,6 @@ class DownloadInvoiceView(APIView):
             textColor=colors.HexColor("#475569")
         )
 
-        val_bold_style = ParagraphStyle(
-            "ValueBoldStyle",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=9,
-            leading=12,
-            textColor=colors.HexColor("#1e293b")
-        )
-
         tbl_hdr_style = ParagraphStyle(
             "TableHeader",
             parent=styles["Normal"],
@@ -780,7 +745,7 @@ class DownloadInvoiceView(APIView):
         tbl_cell_right = ParagraphStyle(
             "TableCellRight",
             parent=tbl_cell_style,
-            alignment=2 # Right align
+            alignment=2
         )
 
         tbl_cell_bold_right = ParagraphStyle(
@@ -792,7 +757,6 @@ class DownloadInvoiceView(APIView):
 
         story = []
 
-        # ── 1. Company Identity & Invoice Header (Two Columns) ──
         company_info = """<b>Sold By:</b><br/>
 <b>ShopEase Retail Private Limited</b><br/>
 123 Tech Park, Phase II, Scheme 54,<br/>
@@ -824,7 +788,6 @@ Indore, Madhya Pradesh, 452001<br/>
         story.append(header_table)
         story.append(Spacer(1, 10))
 
-        # Thin divider
         divider = Table([[""]], colWidths=[522])
         divider.setStyle(TableStyle([
             ('LINEABOVE', (0, 0), (-1, -1), 1, colors.HexColor("#e2e8f0")),
@@ -834,7 +797,6 @@ Indore, Madhya Pradesh, 452001<br/>
         story.append(divider)
         story.append(Spacer(1, 10))
 
-        # ── 2. Shipping & Billing Address (Side-by-side) ──
         billing_address = f"""<b>Billing Address:</b><br/>
 {order.snapshot_full_name}<br/>
 {order.snapshot_address_line_1}<br/>
@@ -866,8 +828,6 @@ Phone: {order.snapshot_phone}
         story.append(divider)
         story.append(Spacer(1, 10))
 
-        # ── 3. Products Table ──
-        # Check if IGST or CGST+SGST applies
         is_mp = order.snapshot_state.strip().lower() in ["madhya pradesh", "mp"]
         tax_type = "CGST/SGST" if is_mp else "IGST"
         tax_rate_percent = 18
@@ -888,30 +848,17 @@ Phone: {order.snapshot_phone}
             ]
         ]
 
-        # Calculate pro-rata tax and discounts per item
-        # If total_amount and subtotal are present, we can derive the multiplier:
-        # subtotal / total_amount or calculate details based on order-level discount/tax.
-        # Let's compute accurate item breakdowns.
         items = order.items.all()
         for idx, item in enumerate(items, 1):
-            hsn_code = "8517 12 00"  # default electronic HSN
-            
-            # Simple tax calculation: 18% inclusive or exclusive.
-            # Let's say unit price is base price.
+            hsn_code = "8517 12 00"
             gross_amount = item.price * item.quantity
-            
-            # Pro-rata discount
             item_discount = Decimal("0.00")
             if order.subtotal > 0:
                 item_discount = (gross_amount / order.subtotal) * order.discount
-            
             taxable_val = gross_amount - item_discount
-            
-            # Pro-rata tax
             item_tax = Decimal("0.00")
             if order.subtotal > 0:
                 item_tax = (gross_amount / order.subtotal) * order.tax
-            
             total_val = taxable_val + item_tax
 
             table_data.append([
@@ -928,7 +875,6 @@ Phone: {order.snapshot_phone}
                 Paragraph(f"₹{total_val:.2f}", tbl_cell_right),
             ])
 
-        # Table styling
         prod_table = Table(table_data, colWidths=[25, 110, 50, 45, 25, 50, 50, 35, 45, 45, 42])
         prod_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f8fafc")),
@@ -940,7 +886,6 @@ Phone: {order.snapshot_phone}
         story.append(prod_table)
         story.append(Spacer(1, 15))
 
-        # ── 4. Summary & Totals (Bottom-Right aligned) ──
         tax_str = f"₹{order.tax:.2f}"
         cgst_val = Decimal("0.00")
         sgst_val = Decimal("0.00")
@@ -976,7 +921,6 @@ Phone: {order.snapshot_phone}
             ('TOPPADDING', (0, 0), (-1, -1), 5),
         ]))
 
-        # Align the summary table to the right
         outer_summary_table = Table([[ "", summary_table ]], colWidths=[272, 250])
         outer_summary_table.setStyle(TableStyle([
             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
@@ -984,7 +928,6 @@ Phone: {order.snapshot_phone}
         story.append(outer_summary_table)
         story.append(Spacer(1, 20))
 
-        # ── 5. Declaration & Signatory Section ──
         declaration_text = """<b>Declaration:</b><br/>
 1. We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.<br/>
 2. This is a computer-generated tax invoice and does not require a physical signature.
@@ -1016,3 +959,203 @@ Phone: {order.snapshot_phone}
             content_type="application/pdf"
         )
 
+
+# ===========================================================================
+# VENDOR ORDER ENDPOINTS
+# ===========================================================================
+
+class VendorOrderListView(generics.ListAPIView):
+    """
+    Returns a paginated list of VendorOrders belonging to the authenticated vendor.
+    """
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+    serializer_class = VendorOrderSummarySerializer
+    pagination_class = OrderPagination
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["vendor_order_number", "status"]
+    ordering_fields = ["created_at", "total_amount", "status"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        vendor = self.request.user.vendor_profile
+        return VendorOrder.objects.filter(vendor=vendor).select_related("master_order")
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(queryset, many=True)
+        return Response({
+            "success": True,
+            "results": serializer.data
+        })
+
+
+class VendorOrderDetailView(generics.RetrieveAPIView):
+    """
+    Returns detailed snapshot and items for a specific VendorOrder.
+    """
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+    serializer_class = VendorOrderSerializer
+    lookup_field = "vendor_order_number"
+
+    def get_queryset(self):
+        vendor = self.request.user.vendor_profile
+        return VendorOrder.objects.filter(vendor=vendor).select_related("master_order").prefetch_related("items")
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        return Response({
+            "success": True,
+            "order": serializer.data
+        })
+
+
+class VendorOrderStatusUpdateView(APIView):
+    """
+    PATCH /api/vendors/orders/<vendor_order_number>/status/
+    Updates sub-order status (e.g. from CONFIRMED -> PROCESSING -> PACKED).
+    """
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+
+    def patch(self, request, vendor_order_number):
+        vendor = request.user.vendor_profile
+        vendor_order = get_object_or_404(
+            VendorOrder.objects.select_for_update(),
+            vendor=vendor,
+            vendor_order_number=vendor_order_number
+        )
+
+        new_status = request.data.get("status")
+        valid_transitions = {
+            VendorOrder.CONFIRMED: [VendorOrder.PROCESSING],
+            VendorOrder.PROCESSING: [VendorOrder.PACKED],
+            VendorOrder.PACKED: [VendorOrder.SHIPPED],
+        }
+
+        current = vendor_order.status
+        if current not in valid_transitions or new_status not in valid_transitions[current]:
+            return Response(
+                {"detail": f"Transition from '{current}' to '{new_status}' is invalid."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        with transaction.atomic():
+            vendor_order.status = new_status
+            vendor_order.save(update_fields=["status", "updated_at"])
+            
+            # Recalculate Master Order status
+            from apps.orders.services import reconcile_master_order_status
+            reconcile_master_order_status(vendor_order.master_order)
+
+            from apps.notifications.services import NotificationService
+            event_key = f"VENDOR_ORDER_{new_status.upper()}:{vendor_order.vendor_order_number}"
+            NotificationService.create_notification_on_commit(
+                user=vendor_order.master_order.user,
+                notification_type="ORDER",
+                title=f"Order {new_status.title()}",
+                message=f"Your item order {vendor_order.vendor_order_number} status updated to {new_status}.",
+                event_key=event_key,
+                reference_type="VENDOR_ORDER",
+                reference_id=vendor_order.vendor_order_number,
+            )
+
+        serializer = VendorOrderSerializer(vendor_order, context={"request": request})
+        return Response({
+            "success": True,
+            "message": "Status updated successfully.",
+            "order": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class VendorOrderShipView(APIView):
+    """
+    POST /api/vendors/orders/<vendor_order_number>/ship/
+    Transitions sub-order status to SHIPPED and records courier details.
+    """
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+
+    def post(self, request, vendor_order_number):
+        vendor = request.user.vendor_profile
+        vendor_order = get_object_or_404(
+            VendorOrder.objects.select_for_update(),
+            vendor=vendor,
+            vendor_order_number=vendor_order_number
+        )
+
+        tracking_number = request.data.get("tracking_number", "").strip()
+        carrier_name = request.data.get("carrier_name", "").strip()
+
+        if not tracking_number or not carrier_name:
+            return Response(
+                {"detail": "Both tracking_number and carrier_name are required to ship the order."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if vendor_order.status != VendorOrder.PACKED:
+            return Response(
+                {"detail": f"Order in status '{vendor_order.status}' cannot be shipped. Must be 'packed' first."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        from django.utils import timezone
+        with transaction.atomic():
+            vendor_order.status = VendorOrder.SHIPPED
+            vendor_order.tracking_number = tracking_number
+            vendor_order.carrier_name = carrier_name
+            vendor_order.shipped_at = timezone.now()
+            vendor_order.save(update_fields=["status", "tracking_number", "carrier_name", "shipped_at", "updated_at"])
+
+            from apps.orders.services import reconcile_master_order_status
+            reconcile_master_order_status(vendor_order.master_order)
+
+            from apps.notifications.services import NotificationService
+            event_key = f"VENDOR_ORDER_SHIPPED:{vendor_order.vendor_order_number}"
+            NotificationService.create_notification_on_commit(
+                user=vendor_order.master_order.user,
+                notification_type="ORDER",
+                title="Order Shipped",
+                message=f"Your order {vendor_order.vendor_order_number} has been shipped via {carrier_name} (Tracking: {tracking_number}).",
+                event_key=event_key,
+                reference_type="VENDOR_ORDER",
+                reference_id=vendor_order.vendor_order_number,
+            )
+
+        serializer = VendorOrderSerializer(vendor_order, context={"request": request})
+        return Response({
+            "success": True,
+            "message": "Order shipped successfully.",
+            "order": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class VendorOrderCancelView(APIView):
+    """
+    POST /api/vendors/orders/<vendor_order_number>/cancel/
+    Vendor cancellation of a specific sub-order.
+    """
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+
+    def post(self, request, vendor_order_number):
+        vendor = request.user.vendor_profile
+        vendor_order = get_object_or_404(
+            VendorOrder,
+            vendor=vendor,
+            vendor_order_number=vendor_order_number
+        )
+
+        from apps.orders.services import cancel_vendor_order_by_vendor
+        try:
+            cancel_vendor_order_by_vendor(vendor_order, request.user)
+        except ValidationError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = VendorOrderSerializer(vendor_order, context={"request": request})
+        return Response({
+            "success": True,
+            "message": "Order cancelled successfully by vendor.",
+            "order": serializer.data
+        }, status=status.HTTP_200_OK)

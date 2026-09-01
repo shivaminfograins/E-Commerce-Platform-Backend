@@ -27,6 +27,7 @@ urlpatterns = [
     
     # apps urls
     path("api/admin/notifications/", include("apps.notifications.urls")),
+    path("api/notifications/", include("apps.notifications.urls")),
     path("api/admin/", include("apps.admin_panel.urls")),
     path("api/auth/",include("apps.accounts.urls")),
     path("api/products/",include("apps.products.urls")),
@@ -36,6 +37,9 @@ urlpatterns = [
     path("api/payments/", include("apps.payments.urls")),
     path("api/coupons/", include("apps.coupons.urls")),
     path("api/reviews/", include("apps.reviews.urls")),
+    path("api/vendors/", include("apps.vendors.urls")),
+    path("api/settlements/", include("apps.settlements.urls")),
+    path("api/returns/", include("apps.returns.urls")),
     path("api/products/<int:pk>/reviews/", ProductReviewListView.as_view(), name="product-reviews"),
     
     # JWT Authentication urls

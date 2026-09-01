@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 
 class Notification(models.Model):
     # Notification Types
@@ -33,6 +34,22 @@ class Notification(models.Model):
         (HIGH, "High"),
     ]
 
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="notifications",
+        db_index=True,
+        help_text="Target user for this notification. Null indicates admin/broadcast notification."
+    )
+    event_key = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Unique event key identifier to ensure notification idempotency."
+    )
     title = models.CharField(max_length=255)
     message = models.TextField()
     notification_type = models.CharField(
@@ -61,6 +78,13 @@ class Notification(models.Model):
         ordering = ["-created_at"]
         verbose_name = "Notification"
         verbose_name_plural = "Notifications"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "event_key"],
+                condition=models.Q(event_key__isnull=False) & ~models.Q(event_key=""),
+                name="unique_user_notification_event_key"
+            )
+        ]
 
     def __str__(self):
         return f"[{self.notification_type}] {self.title} - {'Read' if self.is_read else 'Unread'}"

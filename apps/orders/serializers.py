@@ -1,34 +1,12 @@
 """
 apps/orders/serializers.py
 ==========================
-
-Serializer map
---------------
-
-  INPUT (write)
-  ─────────────
-  PlaceOrderSerializer   — POST /api/orders/           body validation
-
-  OUTPUT (read)
-  ─────────────
-  OrderItemSerializer    — one line item (snapshot + live FK ids)
-  OrderSummarySerializer — lightweight list row (no nested items)
-  OrderSerializer        — full detail (nested items + address snapshot)
-
-Design rules
-------------
-* Plain `Serializer` for input → explicit field set, no mass-assignment.
-* `ModelSerializer` for output → DRF generates field mapping automatically,
-  we add computed/nested fields on top.
-* All output serializers mark every field read_only so they can never be
-  accidentally used as input.
-* `SerializerMethodField` for the formatted delivery address avoids shipping
-  nine separate snapshot fields to the list endpoint (bandwidth saving).
 """
 
+from decimal import Decimal
 from rest_framework import serializers
 
-from .models import Order, OrderItem
+from .models import Order, OrderItem, VendorOrder
 from apps.coupons.serializers import CouponSerializer
 
 
@@ -38,19 +16,6 @@ from apps.coupons.serializers import CouponSerializer
 class PlaceOrderSerializer(serializers.Serializer):
     """
     Validates the POST /api/orders/ request body.
-
-    Accepted payload
-    ----------------
-    {
-        "address":        12,              ← Address PK  (required, integer)
-        "payment_method": "cod",           ← Order.PAYMENT_METHOD_CHOICES
-        "coupon_code":    "SAVE10",        ← optional, max 50 chars
-        "notes":          "Leave at door"  ← optional, free text
-    }
-
-    Using a plain Serializer (not ModelSerializer) guarantees that only
-    these four fields are accepted — no accidental write-through to the
-    Order model's other fields.
     """
 
     address = serializers.IntegerField(
@@ -77,6 +42,14 @@ class PlaceOrderSerializer(serializers.Serializer):
         help_text="Optional delivery instructions or customer notes.",
     )
 
+    idempotency_key = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=255,
+        help_text="Unique client-generated key to ensure idempotency."
+    )
+
 
 # ===========================================================================
 # OUTPUT — OrderItemSerializer
@@ -84,16 +57,8 @@ class PlaceOrderSerializer(serializers.Serializer):
 class OrderItemSerializer(serializers.ModelSerializer):
     """
     Serialises one line item inside an Order detail response.
-
-    All data is read-only snapshot data that was frozen at checkout.
-    The live catalogue FK ids (product_id, variant_id) are included so
-    the frontend can optionally deep-link to the current product page —
-    they will be null if the product/variant was removed from the catalogue
-    after the order was placed, which is fine because the snapshot fields
-    always contain the authoritative purchase record.
     """
 
-    # Nullable: SET_NULL means these become None when catalogue entry deleted
     product_id = serializers.IntegerField(
         source="product.id",
         read_only=True,
@@ -104,20 +69,23 @@ class OrderItemSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
     )
+    vendor_order_id = serializers.IntegerField(
+        source="vendor_order.id",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model  = OrderItem
         fields = (
             "id",
-            # ── Live catalogue references (deep-link helpers) ──────────
             "product_id",
             "variant_id",
-            # ── Immutable purchase snapshot ────────────────────────────
+            "vendor_order_id",
             "product_name",
             "variant_name",
             "sku",
             "product_image",
-            # ── Financial snapshot ─────────────────────────────────────
             "price",
             "quantity",
             "total",
@@ -131,20 +99,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
 class OrderSummarySerializer(serializers.ModelSerializer):
     """
     Lightweight serialiser used by GET /api/orders/ (list).
-
-    Does NOT include the nested items array — fetching 20 orders with
-    their items would be expensive and the list view doesn't need them.
-    The frontend can call GET /api/orders/<id>/ for full item detail.
-
-    Includes:
-      • order_number, status, payment_status, payment_method
-      • total_amount, item_count
-      • formatted delivery address (single string, not 9 separate fields)
-      • created_at (for date display and sorting)
-      • is_cancellable (so the UI can show/hide Cancel button per row)
     """
 
-    # ── Human-readable labels for choice fields ────────────────────────────
     status_display         = serializers.CharField(
         source="get_status_display",
         read_only=True,
@@ -158,14 +114,11 @@ class OrderSummarySerializer(serializers.ModelSerializer):
         read_only=True,
     )
 
-    # ── Computed ───────────────────────────────────────────────────────────
     item_count     = serializers.IntegerField(read_only=True)
     is_cancellable = serializers.BooleanField(read_only=True)
 
-    # ── Single-string address (saves bandwidth vs 9 separate fields) ───────
     delivery_address = serializers.SerializerMethodField()
 
-    # ── Preview fields for list views ──────────────────────────────────────
     first_item_image  = serializers.SerializerMethodField()
     first_item_name   = serializers.SerializerMethodField()
     razorpay_order_id = serializers.SerializerMethodField()
@@ -181,14 +134,12 @@ class OrderSummarySerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "order_number",
-            # Status
             "status",
             "status_display",
             "payment_method",
             "payment_method_display",
             "payment_status",
             "payment_status_display",
-            # Financial
             "subtotal",
             "shipping_charge",
             "discount",
@@ -196,7 +147,6 @@ class OrderSummarySerializer(serializers.ModelSerializer):
             "tax",
             "total_amount",
             "grand_total",
-            # Convenience
             "item_count",
             "is_cancellable",
             "delivery_address",
@@ -206,21 +156,14 @@ class OrderSummarySerializer(serializers.ModelSerializer):
             "coupon",
             "coupon_code",
             "notes",
-            # User details
             "user_email",
             "user_username",
-            # Timestamps
             "created_at",
             "updated_at",
         )
         read_only_fields = fields
 
     def get_delivery_address(self, obj):
-        """
-        Returns a compact dict of the snapshot address fields.
-        Using a dict (not a formatted string) lets the frontend
-        render each field independently if needed.
-        """
         return {
             "full_name":      obj.snapshot_full_name,
             "phone":          obj.snapshot_phone,
@@ -242,9 +185,81 @@ class OrderSummarySerializer(serializers.ModelSerializer):
         return first_item.product_name if first_item else "Order Items"
 
     def get_razorpay_order_id(self, obj):
-        # Retrieve the latest pending Razorpay transaction associated with this order
         last_txn = obj.transactions.filter(payment_method="razorpay", status="pending").first()
         return last_txn.razorpay_order_id if last_txn else ""
+
+
+# ===========================================================================
+# VENDOR ORDER SERIALIZERS
+# ===========================================================================
+class VendorOrderSummarySerializer(serializers.ModelSerializer):
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    master_order_number = serializers.CharField(source="master_order.order_number", read_only=True)
+    item_count = serializers.SerializerMethodField()
+    customer_name = serializers.CharField(source="master_order.snapshot_full_name", read_only=True)
+    customer_phone = serializers.CharField(source="master_order.snapshot_phone", read_only=True)
+    delivery_city = serializers.CharField(source="master_order.snapshot_city", read_only=True)
+
+    class Meta:
+        model = VendorOrder
+        fields = (
+            "id",
+            "vendor_order_number",
+            "master_order_number",
+            "status",
+            "status_display",
+            "subtotal",
+            "shipping_charge",
+            "discount",
+            "tax",
+            "total_amount",
+            "item_count",
+            "customer_name",
+            "customer_phone",
+            "delivery_city",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_item_count(self, obj):
+        return obj.items.count()
+
+
+class VendorOrderSerializer(VendorOrderSummarySerializer):
+    items = OrderItemSerializer(many=True, read_only=True)
+    delivery_address = serializers.SerializerMethodField()
+    master_order_status = serializers.CharField(source="master_order.status", read_only=True)
+    master_order_payment_status = serializers.CharField(source="master_order.payment_status", read_only=True)
+
+    class Meta(VendorOrderSummarySerializer.Meta):
+        fields = VendorOrderSummarySerializer.Meta.fields + (
+            "items",
+            "delivery_address",
+            "master_order_status",
+            "master_order_payment_status",
+            "tracking_number",
+            "carrier_name",
+            "shipped_at",
+            "delivered_at",
+            "vendor_store_name_snapshot",
+            "vendor_business_name_snapshot",
+        )
+        read_only_fields = fields
+
+    def get_delivery_address(self, obj):
+        mo = obj.master_order
+        return {
+            "full_name":      mo.snapshot_full_name,
+            "phone":          mo.snapshot_phone,
+            "address_line_1": mo.snapshot_address_line_1,
+            "address_line_2": mo.snapshot_address_line_2,
+            "landmark":       mo.snapshot_landmark,
+            "city":           mo.snapshot_city,
+            "state":          mo.snapshot_state,
+            "country":        mo.snapshot_country,
+            "postal_code":    mo.snapshot_postal_code,
+        }
 
 
 # ===========================================================================
@@ -252,24 +267,14 @@ class OrderSummarySerializer(serializers.ModelSerializer):
 # ===========================================================================
 class OrderSerializer(OrderSummarySerializer):
     """
-    Full order detail serialiser used by:
-      • POST /api/orders/        (create response)
-      • GET  /api/orders/<id>/   (detail response)
-      • PATCH /api/orders/<id>/cancel/  (cancel response)
-
-    Inherits all fields from OrderSummarySerializer and adds:
-      • items  — nested list of OrderItemSerializer
-      • The nine raw snapshot address fields (for invoice rendering)
-
-    Inheriting from OrderSummarySerializer avoids duplicating the
-    computed fields (status_display, item_count, delivery_address, etc.).
+    Full order detail serialiser.
     """
 
     items = OrderItemSerializer(many=True, read_only=True)
+    vendor_orders = VendorOrderSerializer(many=True, read_only=True)
 
     class Meta(OrderSummarySerializer.Meta):
         fields = OrderSummarySerializer.Meta.fields + (
-            # ── Raw snapshot fields (for invoice / packing slip) ───────
             "snapshot_full_name",
             "snapshot_phone",
             "snapshot_address_line_1",
@@ -279,7 +284,7 @@ class OrderSerializer(OrderSummarySerializer):
             "snapshot_state",
             "snapshot_country",
             "snapshot_postal_code",
-            # ── Nested line items ──────────────────────────────────────
             "items",
+            "vendor_orders",
         )
         read_only_fields = fields

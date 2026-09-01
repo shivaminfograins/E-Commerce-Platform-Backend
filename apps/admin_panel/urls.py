@@ -16,6 +16,9 @@ from .views import (
     AdminSettingsView,
 )
 from apps.coupons.views import AdminCouponViewSet
+from apps.vendors.views import AdminVendorViewSet
+from apps.settlements.views import AdminSettlementViewSet
+from apps.returns.views import AdminReturnViewSet
 
 router = DefaultRouter()
 router.register("categories", AdminCategoryViewSet, basename="admin-categories")
@@ -24,6 +27,9 @@ router.register("customers", AdminCustomerViewSet, basename="admin-customers")
 router.register("addresses", AdminAddressViewSet, basename="admin-addresses")
 router.register("orders", AdminOrderViewSet, basename="admin-orders")
 router.register("coupons", AdminCouponViewSet, basename="admin-coupons")
+router.register("vendors", AdminVendorViewSet, basename="admin-vendors")
+router.register("settlements", AdminSettlementViewSet, basename="admin-settlements")
+router.register("returns", AdminReturnViewSet, basename="admin-returns")
 
 urlpatterns = [
     path("auth/login/", AdminLoginView.as_view(), name="admin_login"),

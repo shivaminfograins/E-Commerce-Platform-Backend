@@ -62,6 +62,8 @@ INSTALLED_APPS = [
     'apps.notifications',
     'apps.dashboard',
     'apps.vendors',
+    'apps.settlements',
+    'apps.returns',
     'apps.common',
 ]
 
@@ -169,6 +171,9 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
 # Media files Configuration
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Frontend URL configuration (required for password reset tests)
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 
 # Razorpay Configuration
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_test_mockkeyid123")

@@ -5,14 +5,22 @@ from .views import (
     MarkReadView,
     MarkAllReadView,
     NotificationDeleteView,
-    TestNotificationView,
+    CustomerNotificationListView,
+    CustomerUnreadCountView,
+    CustomerMarkReadView,
+    CustomerMarkAllReadView,
 )
 
 urlpatterns = [
-    path("", NotificationListView.as_view(), name="notification-list"),
-    path("unread-count/", UnreadCountView.as_view(), name="unread-count"),
-    path("mark-all-read/", MarkAllReadView.as_view(), name="mark-all-read"),
-    path("<int:pk>/mark-read/", MarkReadView.as_view(), name="mark-read"),
-    path("<int:pk>/", NotificationDeleteView.as_view(), name="notification-delete"),
-    path("test/", TestNotificationView.as_view(), name="test-notification"),
+    # Customer endpoints (/api/notifications/...)
+    path("", CustomerNotificationListView.as_view(), name="customer-notification-list"),
+    path("unread-count/", CustomerUnreadCountView.as_view(), name="customer-unread-count"),
+    path("read-all/", CustomerMarkAllReadView.as_view(), name="customer-read-all"),
+    path("mark-all-read/", CustomerMarkAllReadView.as_view(), name="customer-mark-all-read"),
+    path("<int:pk>/read/", CustomerMarkReadView.as_view(), name="customer-mark-read"),
+    path("<int:pk>/mark-read/", CustomerMarkReadView.as_view(), name="customer-mark-read-alt"),
+
+    # Legacy / Admin endpoints (/api/admin/notifications/...)
+    path("admin-list/", NotificationListView.as_view(), name="admin-notification-list"),
+    path("admin-unread-count/", UnreadCountView.as_view(), name="admin-unread-count"),
 ]

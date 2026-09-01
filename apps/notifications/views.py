@@ -117,29 +117,73 @@ class NotificationDeleteView(DestroyAPIView):
     serializer_class = NotificationSerializer
     permission_classes = [AdminPermission]
 
-class TestNotificationView(APIView):
+from rest_framework.permissions import IsAuthenticated
+
+class CustomerNotificationListView(ListAPIView):
     """
-    POST /api/admin/notifications/test/
-    Creates a mock/test notification.
+    GET /api/notifications/
+    Returns paginated notifications belonging exclusively to request.user.
     """
-    permission_classes = [AdminPermission]
+    serializer_class = NotificationSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = NotificationPagination
+
+    def get_queryset(self):
+        queryset = Notification.objects.filter(user=self.request.user)
+
+        is_read = self.request.query_params.get("is_read")
+        if is_read is not None:
+            if is_read.lower() == "true":
+                queryset = queryset.filter(is_read=True)
+            elif is_read.lower() == "false":
+                queryset = queryset.filter(is_read=False)
+
+        notification_type = self.request.query_params.get("notification_type")
+        if notification_type:
+            queryset = queryset.filter(notification_type=notification_type.upper())
+
+        return queryset.order_by("-created_at")
+
+class CustomerUnreadCountView(APIView):
+    """
+    GET /api/notifications/unread-count/
+    Returns unread count for request.user.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        count = Notification.objects.filter(user=request.user, is_read=False).count()
+        return Response({"unread_count": count, "count": count}, status=status.HTTP_200_OK)
+
+class CustomerMarkReadView(APIView):
+    """
+    PATCH /api/notifications/<pk>/read/
+    Marks a single notification belonging to request.user as read.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        try:
+            notification = Notification.objects.get(pk=pk, user=request.user)
+            notification.is_read = True
+            notification.save(update_fields=["is_read", "updated_at"])
+            return Response(NotificationSerializer(notification).data, status=status.HTTP_200_OK)
+        except Notification.DoesNotExist:
+            return Response({"error": "Notification not found"}, status=status.HTTP_404_NOT_FOUND)
+
+class CustomerMarkAllReadView(APIView):
+    """
+    POST /api/notifications/read-all/ or PATCH /api/notifications/mark-all-read/
+    Marks all notifications belonging to request.user as read.
+    """
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        notification_type = request.data.get("notification_type", "SYSTEM")
-        priority = request.data.get("priority", "MEDIUM")
-        title = request.data.get("title", f"Test {notification_type} Alert")
-        message = request.data.get("message", "This is a test notification generated for development purposes.")
-        
-        notification = NotificationService.create(
-            title=title,
-            message=message,
-            notification_type=notification_type,
-            priority=priority,
-            reference_type=request.data.get("reference_type"),
-            reference_id=request.data.get("reference_id"),
-            action_url=request.data.get("action_url"),
-            icon=request.data.get("icon")
-        )
-        if notification:
-            return Response(NotificationSerializer(notification).data, status=status.HTTP_201_CREATED)
-        return Response({"error": "Failed to create notification"}, status=status.HTTP_400_BAD_REQUEST)
+        return self._mark_all(request)
+
+    def patch(self, request):
+        return self._mark_all(request)
+
+    def _mark_all(self, request):
+        updated_count = Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        return Response({"message": "All notifications marked as read", "updated_count": updated_count}, status=status.HTTP_200_OK)

@@ -687,14 +687,19 @@ class AdminOrderViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        from apps.orders.services import cancel_vendor_order_by_vendor, reconcile_master_order_status
         with transaction.atomic():
-            for item in order.items.all():
-                if item.variant_id:
-                    ProductVariant.objects.filter(pk=item.variant_id).update(
-                        stock=F("stock") + item.quantity
-                    )
+            sub_orders = list(order.vendor_orders.exclude(status="cancelled"))
+            for sub_order in sub_orders:
+                try:
+                    cancel_vendor_order_by_vendor(sub_order, request.user)
+                except Exception:
+                    pass
+
             order.status = Order.CANCELLED
             order.save(update_fields=["status", "updated_at"])
+            reconcile_master_order_status(order)
+            order.refresh_from_db()
 
         serializer = OrderSerializer(order, context={"request": request})
         return Response(
