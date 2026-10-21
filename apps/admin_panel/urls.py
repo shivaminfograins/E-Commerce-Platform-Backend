@@ -14,6 +14,7 @@ from .views import (
     AdminProfileView,
     AdminChangePasswordView,
     AdminSettingsView,
+    AdminVendorProductRequestViewSet,
 )
 from apps.coupons.views import AdminCouponViewSet
 from apps.vendors.views import AdminVendorViewSet
@@ -23,6 +24,7 @@ from apps.returns.views import AdminReturnViewSet
 router = DefaultRouter()
 router.register("categories", AdminCategoryViewSet, basename="admin-categories")
 router.register("products", AdminProductViewSet, basename="admin-products")
+router.register("product-requests", AdminVendorProductRequestViewSet, basename="admin-product-requests")
 router.register("customers", AdminCustomerViewSet, basename="admin-customers")
 router.register("addresses", AdminAddressViewSet, basename="admin-addresses")
 router.register("orders", AdminOrderViewSet, basename="admin-orders")
@@ -58,5 +60,3 @@ urlpatterns = [
 
     path("", include(router.urls)),
 ]
-
-

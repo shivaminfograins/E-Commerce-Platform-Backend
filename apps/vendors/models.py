@@ -1,4 +1,4 @@
-from django.db import models
+﻿from django.db import models
 from django.conf import settings
 
 class Vendor(models.Model):
@@ -61,6 +61,12 @@ class VendorAddress(models.Model):
     state = models.CharField(max_length=100)
     country = models.CharField(max_length=100, default="India")
     postal_code = models.CharField(max_length=20)
+    shiprocket_pickup_location_name = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Nickname of the pickup location registered in Shiprocket dashboard."
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -184,6 +190,30 @@ class VendorProduct(models.Model):
     def __str__(self):
         return f"{self.vendor.business_name} - {self.product.name} ({self.status})"
 
+    @property
+    def is_effectively_active(self):
+        return self.status == "ACTIVE" and self.product.is_active
+
+    @property
+    def effective_status(self):
+        if self.status == "SUSPENDED":
+            return "SUSPENDED"
+        if not self.product.is_active:
+            return "FROZEN"
+        if self.status != "ACTIVE":
+            return self.status
+        if self.vendor_variants.exists():
+            active_vars = self.vendor_variants.filter(is_active=True)
+            if not active_vars.exists():
+                return "INACTIVE"
+            if any(v.stock > 0 for v in active_vars):
+                return "AVAILABLE"
+            return "OUT_OF_STOCK"
+        else:
+            if (self.stock or 0) > 0:
+                return "AVAILABLE"
+            return "OUT_OF_STOCK" 
+
     def delete(self, *args, **kwargs):
         if self.inventory_movements.exists():
             from django.core.exceptions import ValidationError
@@ -221,8 +251,20 @@ class VendorProductVariant(models.Model):
     )
     product_variant = models.ForeignKey(
         "products.ProductVariant",
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="vendor_offers"
+    )
+    variant_name = models.CharField(
+        max_length=150,
+        blank=True,
+        help_text="e.g. Black / 128GB or Red / XL"
+    )
+    attributes = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Custom key-value attributes e.g. {'Color': 'Red', 'Size': 'XL'}"
     )
     price = models.DecimalField(
         max_digits=10,
@@ -247,27 +289,56 @@ class VendorProductVariant(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["vendor_product", "product_variant"],
-                name="unique_vendor_product_variant"
-            )
+                condition=models.Q(product_variant__isnull=False),
+                name="unique_vendor_product_master_variant"
+            ),
+            models.UniqueConstraint(
+                fields=["vendor_product", "variant_name"],
+                condition=models.Q(variant_name__isnull=False) & ~models.Q(variant_name=""),
+                name="unique_vendor_product_custom_variant_name"
+            ),
         ]
 
+    @property
+    def is_effectively_active(self):
+        return (
+            self.is_active and
+            self.vendor_product.status == "ACTIVE" and
+            self.vendor_product.product.is_active
+        )
+
+    @property
+    def effective_status(self):
+        if self.vendor_product.status == "SUSPENDED":
+            return "SUSPENDED"
+        if not self.vendor_product.product.is_active:
+            return "FROZEN"
+        if self.vendor_product.status != "ACTIVE":
+            return self.vendor_product.status
+        if not self.is_active:
+            return "INACTIVE"
+        if (self.stock or 0) > 0:
+            return "AVAILABLE"
+        return "OUT_OF_STOCK" 
+
+    @property
+    def display_name(self):
+        if self.variant_name:
+            return self.variant_name
+        if self.product_variant:
+            return self.product_variant.name
+        return "Default Variant"
+
     def __str__(self):
-        return f"{self.vendor_product.vendor.business_name} - {self.product_variant.name} (Rs. {self.price})"
+        return f"{self.vendor_product.vendor.business_name} - {self.display_name} (Rs. {self.price})"
 
     def clean(self):
         from django.core.exceptions import ValidationError
         super().clean()
         if self.vendor_product_id and self.product_variant_id:
-            # Critical data integrity: Variant must belong to the same master Product
             if self.product_variant.product_id != self.vendor_product.product_id:
                 raise ValidationError(
                     "The selected product variant does not belong to the master product listed in VendorProduct."
-                )
-            
-            # Parent product must actually have variants
-            if not self.vendor_product.product.variants.exists():
-                raise ValidationError(
-                    "Cannot create a vendor product variant for a product that does not have variants."
                 )
 
     def delete(self, *args, **kwargs):
@@ -366,4 +437,81 @@ def protect_vendor_product_variant_delete(sender, instance, **kwargs):
         from django.core.exceptions import ValidationError
         raise ValidationError("Cannot delete variant with active inventory history. Set is_active to False instead.")
 
+
+
+
+
+class VendorProductVariantImage(models.Model):
+    vendor_variant = models.ForeignKey(
+        VendorProductVariant,
+        on_delete=models.CASCADE,
+        related_name="images"
+    )
+    image = models.ImageField(upload_to="vendor_variants/")
+    alt_text = models.CharField(max_length=255, blank=True)
+    is_primary = models.BooleanField(default=False)
+    display_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Vendor Product Variant Image"
+        verbose_name_plural = "Vendor Product Variant Images"
+        ordering = ["display_order", "id"]
+
+    def __str__(self):
+        return f"Image for {self.vendor_variant}"
+
+
+class VendorProductRequest(models.Model):
+    STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+    ]
+
+    vendor = models.ForeignKey(
+        Vendor,
+        on_delete=models.CASCADE,
+        related_name="product_requests"
+    )
+    product_name = models.CharField(max_length=255)
+    category = models.ForeignKey(
+        "products.Category",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="product_requests"
+    )
+    brand = models.ForeignKey(
+        "products.Brand",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="product_requests"
+    )
+    description = models.TextField(blank=True)
+    image = models.ImageField(upload_to='vendor_product_requests/', null=True, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="PENDING"
+    )
+    admin_notes = models.TextField(blank=True)
+    created_master_product = models.ForeignKey(
+        "products.Product",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="origin_request"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Vendor Product Request"
+        verbose_name_plural = "Vendor Product Requests"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Request for {self.product_name} by {self.vendor}"
 

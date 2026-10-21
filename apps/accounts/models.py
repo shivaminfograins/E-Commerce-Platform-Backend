@@ -113,6 +113,7 @@ class Profile(models.Model):
 #         return f"{self.full_name} - {self.city}"
 
 #------------- New Address Model ---------------
+
 class Address(models.Model):
     
     HOME = "home"

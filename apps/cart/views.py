@@ -172,6 +172,12 @@ class CartAPIView(APIView):
             stock = vendor_product.stock
             variant = None
 
+        if stock <= 0:
+            return Response(
+                {"detail": "This item is currently out of stock."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         guest_token = None
 
         # Build query parameters

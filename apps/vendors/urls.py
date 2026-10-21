@@ -10,6 +10,9 @@ from .views import (
     VendorCatalogProductDetailView,
     VendorProductViewSet,
     VendorProductVariantDeleteView,
+    VendorProductVariantImageCreateView,
+    VendorProductVariantImageDeleteView,
+    VendorProductRequestViewSet,
     VendorInventoryListView,
     VendorInventoryDetailView,
     VendorInventoryHistoryListView,
@@ -31,9 +34,13 @@ from apps.settlements.views import (
 )
 
 from apps.returns.views import VendorReturnViewSet
+from apps.coupons.views import VendorCouponViewSet
 
 vendor_return_router = DefaultRouter()
 vendor_return_router.register(r"", VendorReturnViewSet, basename="vendor-returns")
+
+vendor_coupon_router = DefaultRouter()
+vendor_coupon_router.register(r"", VendorCouponViewSet, basename="vendor-coupons")
 
 urlpatterns = [
     path("apply/", VendorApplyView.as_view(), name="vendor-apply"),
@@ -50,10 +57,14 @@ urlpatterns = [
     
     # Vendor listings CRUD
     path("products/", VendorProductViewSet.as_view({"get": "list", "post": "create"}), name="vendor-product-list"),
+    path("product-requests/", VendorProductRequestViewSet.as_view({"get": "list", "post": "create"}), name="vendor-product-request-list"),
+    path("product-requests/<int:pk>/", VendorProductRequestViewSet.as_view({"get": "retrieve", "delete": "destroy"}), name="vendor-product-request-detail"),
     path("products/<int:pk>/", VendorProductViewSet.as_view({"get": "retrieve", "patch": "partial_update", "put": "update", "delete": "destroy"}), name="vendor-product-detail"),
     
     # Explicit variant deletion
     path("products/variants/<int:pk>/", VendorProductVariantDeleteView.as_view(), name="vendor-product-variant-delete"),
+    path("products/variants/<int:variant_id>/images/", VendorProductVariantImageCreateView.as_view(), name="vendor-variant-image-create"),
+    path("products/variants/images/<int:pk>/", VendorProductVariantImageDeleteView.as_view(), name="vendor-variant-image-delete"),
 
     # Inventory and Movements
     path("inventory/movements/", VendorInventoryHistoryListView.as_view(), name="vendor-inventory-history"),
@@ -73,6 +84,9 @@ urlpatterns = [
     path("settlements/", VendorSettlementListView.as_view(), name="vendor-settlement-list"),
     path("settlements/summary/", VendorSettlementSummaryView.as_view(), name="vendor-settlement-summary"),
     path("settlements/<int:pk>/", VendorSettlementDetailView.as_view(), name="vendor-settlement-detail"),
+
+    # Coupon management
+    path("coupons/", include(vendor_coupon_router.urls)),
 
     # Return management
     path("returns/", include(vendor_return_router.urls)),

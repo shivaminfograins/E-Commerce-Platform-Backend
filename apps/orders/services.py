@@ -25,10 +25,32 @@ def create_split_vendor_orders(master_order, cart_items, user):
     master_discount = master_order.discount
     master_subtotal = master_order.subtotal
 
+    coupon = master_order.coupon
+    funding_type = coupon.funding_type if (coupon and master_discount > Decimal("0.00")) else "NONE"
+    coupon_vendor = coupon.vendor if coupon else None
+
+    # Populate master order snapshot fields
+    master_order.coupon_owner_vendor = coupon_vendor
+    master_order.discount_funding_type = funding_type
+    if funding_type == "VENDOR_FUNDED":
+        master_order.vendor_discount_amount = master_discount
+        master_order.platform_discount_amount = Decimal("0.00")
+    elif funding_type == "PLATFORM_FUNDED":
+        master_order.platform_discount_amount = master_discount
+        master_order.vendor_discount_amount = Decimal("0.00")
+    else:
+        master_order.platform_discount_amount = Decimal("0.00")
+        master_order.vendor_discount_amount = Decimal("0.00")
+    
+    master_order.save(update_fields=[
+        "coupon_owner_vendor", "discount_funding_type",
+        "platform_discount_amount", "vendor_discount_amount", "updated_at"
+    ])
+
     allocated_discounts = {}
     running_discount_sum = Decimal("0.00")
 
-    # Allocate proportional discount
+    # Allocate discounts based on funding type
     for i, vendor in enumerate(vendor_list):
         items = items_by_vendor[vendor]
         vendor_subtotal = sum(
@@ -36,19 +58,41 @@ def create_split_vendor_orders(master_order, cart_items, user):
             for item in items
         )
         
-        if i == len(vendor_list) - 1:
-            # Last vendor absorbs rounding difference
-            vendor_discount = master_discount - running_discount_sum
-        else:
-            if master_subtotal > 0:
-                vendor_discount = (vendor_subtotal / master_subtotal * master_discount).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if funding_type == "VENDOR_FUNDED":
+            if coupon_vendor and vendor == coupon_vendor:
+                vendor_discount = master_discount
+                v_plat_discount = Decimal("0.00")
+                v_vend_discount = master_discount
+                v_fund_type = "VENDOR_FUNDED"
             else:
                 vendor_discount = Decimal("0.00")
-            running_discount_sum += vendor_discount
+                v_plat_discount = Decimal("0.00")
+                v_vend_discount = Decimal("0.00")
+                v_fund_type = "NONE"
+        elif funding_type == "PLATFORM_FUNDED":
+            if i == len(vendor_list) - 1:
+                vendor_discount = master_discount - running_discount_sum
+            else:
+                if master_subtotal > 0:
+                    vendor_discount = (vendor_subtotal / master_subtotal * master_discount).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                else:
+                    vendor_discount = Decimal("0.00")
+                running_discount_sum += vendor_discount
+            v_plat_discount = vendor_discount
+            v_vend_discount = Decimal("0.00")
+            v_fund_type = "PLATFORM_FUNDED"
+        else:
+            vendor_discount = Decimal("0.00")
+            v_plat_discount = Decimal("0.00")
+            v_vend_discount = Decimal("0.00")
+            v_fund_type = "NONE"
 
         allocated_discounts[vendor] = {
             "subtotal": vendor_subtotal,
-            "discount": vendor_discount
+            "discount": vendor_discount,
+            "platform_discount_amount": v_plat_discount,
+            "vendor_discount_amount": v_vend_discount,
+            "discount_funding_type": v_fund_type
         }
 
     # Create sub-orders & snapshot details
@@ -60,6 +104,9 @@ def create_split_vendor_orders(master_order, cart_items, user):
             subtotal=finances["subtotal"],
             shipping_charge=Decimal("0.00"),  # shipping stays at master level
             discount=finances["discount"],
+            platform_discount_amount=finances["platform_discount_amount"],
+            vendor_discount_amount=finances["vendor_discount_amount"],
+            discount_funding_type=finances["discount_funding_type"],
             tax=(finances["subtotal"] * Decimal("0.00")).quantize(Decimal("0.01")),  # tax calculation
             vendor_store_name_snapshot=vendor.store_name,
             vendor_business_name_snapshot=vendor.business_name,

@@ -78,7 +78,7 @@ def record_inventory_movement(
 
             # Snapshots
             product_name_snapshot = vendor_product.product.name
-            variant_name_snapshot = variant.product_variant.name
+            variant_name_snapshot = variant.display_name if variant else ''
 
             movement = VendorInventoryMovement.objects.create(
                 vendor=vendor_profile,

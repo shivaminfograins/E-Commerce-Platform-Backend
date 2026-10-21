@@ -1,7 +1,8 @@
+from django.core.exceptions import ValidationError
 from rest_framework import serializers
 from django.urls import reverse
 from django.contrib.auth import get_user_model
-from .models import Vendor, VendorAddress, VendorDocument, VendorBankAccount
+from .models import Vendor, VendorAddress, VendorDocument, VendorBankAccount, VendorProductRequest
 
 User = get_user_model()
 
@@ -131,7 +132,7 @@ class VendorStoreProfileUpdateSerializer(serializers.ModelSerializer):
 
 
 from apps.products.models import Product, ProductVariant
-from .models import VendorProduct, VendorProductVariant
+from .models import VendorProduct, VendorProductVariant, VendorProductVariantImage
 from apps.products.serializers import ProductVariantSerializer
 
 class VendorCatalogProductSerializer(serializers.ModelSerializer):
@@ -149,6 +150,19 @@ class VendorCatalogProductSerializer(serializers.ModelSerializer):
             "has_variants", "already_listed", "variants"
         ]
 
+    def get_price_display(self, obj):
+        active_vars = obj.vendor_variants.filter(is_active=True)
+        if active_vars.exists():
+            prices = [v.price for v in active_vars if v.price is not None]
+            if prices:
+                min_p, max_p = min(prices), max(prices)
+                if min_p == max_p:
+                    return f"₹{min_p:,.2f}"
+                return f"₹{min_p:,.2f} - ₹{max_p:,.2f}"
+        if obj.price is not None:
+            return f"₹{obj.price:,.2f}"
+        return "N/A"
+
     def get_has_variants(self, obj):
         return obj.variants.exists()
 
@@ -162,17 +176,37 @@ class VendorCatalogProductSerializer(serializers.ModelSerializer):
         return False
 
 
+class VendorProductVariantImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VendorProductVariantImage
+        fields = ["id", "image", "is_primary", "display_order", "alt_text"]
+
+
+class VendorProductVariantImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VendorProductVariantImage
+        fields = ["id", "image", "is_primary", "display_order", "alt_text"]
+
+
 class VendorProductVariantSerializer(serializers.ModelSerializer):
-    variant_name = serializers.CharField(source="product_variant.name", read_only=True)
-    variant_sku = serializers.CharField(source="product_variant.sku", read_only=True)
+    variant_name = serializers.CharField(required=False, allow_blank=True)
+    variant_sku = serializers.CharField(source="product_variant.sku", read_only=True, required=False)
+    is_effectively_active = serializers.BooleanField(read_only=True)
+    images = VendorProductVariantImageSerializer(many=True, read_only=True)
+    effective_status = serializers.CharField(read_only=True)
 
     class Meta:
         model = VendorProductVariant
         fields = [
-            "id", "vendor_product", "product_variant", "variant_name", "variant_sku", 
-            "price", "stock", "vendor_sku", "is_active", "created_at", "updated_at"
+            "id", "vendor_product", "product_variant", "variant_name", "attributes", "variant_sku", 
+            "price", "stock", "vendor_sku", "is_active", "is_effectively_active", "effective_status", "images", "created_at", "updated_at"
         ]
         read_only_fields = ["id", "vendor_product", "created_at", "updated_at"]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["variant_name"] = instance.display_name
+        return ret
 
 
 class VendorProductSerializer(serializers.ModelSerializer):
@@ -181,16 +215,66 @@ class VendorProductSerializer(serializers.ModelSerializer):
     product_slug = serializers.CharField(source="product.slug", read_only=True)
     product_description = serializers.CharField(source="product.description", read_only=True)
     category_name = serializers.CharField(source="product.category.name", read_only=True)
+    brand_name = serializers.CharField(source="product.brand.name", read_only=True, default="")
+    master_product_active = serializers.BooleanField(source="product.is_active", read_only=True)
+    effective_status = serializers.CharField(read_only=True)
+    price_display = serializers.SerializerMethodField()
     master_variants = serializers.SerializerMethodField()
+    has_variants = serializers.SerializerMethodField()
+    variant_count = serializers.SerializerMethodField()
+    sku = serializers.SerializerMethodField()
+    thumbnail = serializers.SerializerMethodField()
 
     class Meta:
         model = VendorProduct
         fields = [
             "id", "vendor", "product", "product_name", "product_slug", "product_description", 
-            "category_name", "status", "price", "stock", "vendor_variants", "master_variants", 
+            "category_name", "brand_name", "status", "effective_status", "master_product_active",
+            "price", "price_display", "stock", "has_variants", "variant_count",
+            "sku", "thumbnail", "vendor_variants", "master_variants", 
             "created_at", "updated_at"
         ]
         read_only_fields = ["id", "vendor", "created_at", "updated_at"]
+
+    def get_price_display(self, obj):
+        active_vars = obj.vendor_variants.filter(is_active=True)
+        if active_vars.exists():
+            prices = [v.price for v in active_vars if v.price is not None]
+            if prices:
+                min_p, max_p = min(prices), max(prices)
+                if min_p == max_p:
+                    return f"₹{min_p:,.2f}"
+                return f"₹{min_p:,.2f} - ₹{max_p:,.2f}"
+        if obj.price is not None:
+            return f"₹{obj.price:,.2f}"
+        return "N/A"
+
+    def get_has_variants(self, obj):
+        return obj.vendor_variants.exists() or obj.product.variants.exists()
+
+    def get_variant_count(self, obj):
+        return obj.vendor_variants.count()
+
+    def get_sku(self, obj):
+        if obj.product.variants.exists():
+            vpv = obj.vendor_variants.filter(is_active=True).first()
+            if vpv and vpv.vendor_sku:
+                return vpv.vendor_sku
+            first_pv = obj.product.variants.first()
+            return first_pv.sku if first_pv else ""
+        first_pv = obj.product.variants.first()
+        return first_pv.sku if first_pv else f"VP-{obj.id}"
+
+    def get_thumbnail(self, obj):
+        first_pv = obj.product.variants.first()
+        if first_pv:
+            primary_img = first_pv.images.filter(is_primary=True).first() or first_pv.images.first()
+            if primary_img and primary_img.image:
+                request = self.context.get("request")
+                if request:
+                    return request.build_absolute_uri(primary_img.image.url)
+                return primary_img.image.url
+        return None
 
     def get_master_variants(self, obj):
         return ProductVariantSerializer(obj.product.variants.all(), many=True, context=self.context).data
@@ -221,7 +305,7 @@ class VendorProductSerializer(serializers.ModelSerializer):
         
         if target_status == "ACTIVE":
             if product:
-                has_variants = product.variants.exists()
+                has_variants = product.variants.exists() or bool(self.initial_data.get("vendor_variants")) or (instance and instance.vendor_variants.exists())
                 if not has_variants:
                     p_val = price if "price" in attrs else (instance.price if instance else None)
                     s_val = stock if "stock" in attrs else (instance.stock if instance else None)
@@ -308,6 +392,8 @@ class VendorProductSerializer(serializers.ModelSerializer):
                     vpv = VendorProductVariant(
                         vendor_product=vendor_product,
                         product_variant=p_var,
+                        variant_name=variant_data.get("variant_name", ""),
+                        attributes=variant_data.get("attributes", {}),
                         price=variant_data.get("price"),
                         stock=0,
                         vendor_sku=variant_data.get("vendor_sku", ""),
@@ -364,14 +450,25 @@ class VendorProductSerializer(serializers.ModelSerializer):
 
             if vendor_variants_data is not None:
                 for variant_data in vendor_variants_data:
+                    vpv_id = variant_data.get("id")
                     p_var = variant_data.get("product_variant")
-                    if not p_var:
-                        continue
-                    
-                    vpv = instance.vendor_variants.filter(product_variant=p_var).first()
+                    v_name = variant_data.get("variant_name", "")
+                    attrs_data = variant_data.get("attributes", {})
+
+                    vpv = None
+                    if vpv_id:
+                        vpv = instance.vendor_variants.filter(id=vpv_id).first()
+                    elif p_var:
+                        vpv = instance.vendor_variants.filter(product_variant=p_var).first()
+                    elif v_name:
+                        vpv = instance.vendor_variants.filter(variant_name=v_name).first()
                     req_stock = variant_data.get("stock")
 
                     if vpv:
+                        if "variant_name" in variant_data:
+                            vpv.variant_name = variant_data["variant_name"]
+                        if "attributes" in variant_data:
+                            vpv.attributes = variant_data["attributes"]
                         if "price" in variant_data:
                             vpv.price = variant_data["price"]
                         if "vendor_sku" in variant_data:
@@ -402,6 +499,8 @@ class VendorProductSerializer(serializers.ModelSerializer):
                         vpv = VendorProductVariant(
                             vendor_product=instance,
                             product_variant=p_var,
+                            variant_name=v_name,
+                            attributes=attrs_data,
                             price=variant_data.get("price"),
                             stock=0,
                             vendor_sku=variant_data.get("vendor_sku", ""),
@@ -483,7 +582,35 @@ class VendorInventorySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    def get_price_display(self, obj):
+        active_vars = obj.vendor_variants.filter(is_active=True)
+        if active_vars.exists():
+            prices = [v.price for v in active_vars if v.price is not None]
+            if prices:
+                min_p, max_p = min(prices), max(prices)
+                if min_p == max_p:
+                    return f"₹{min_p:,.2f}"
+                return f"₹{min_p:,.2f} - ₹{max_p:,.2f}"
+        if obj.price is not None:
+            return f"₹{obj.price:,.2f}"
+        return "N/A"
+
     def get_has_variants(self, obj):
-        return obj.product.variants.exists()
+        return obj.vendor_variants.exists() or obj.product.variants.exists()
 
 
+
+
+class VendorProductRequestSerializer(serializers.ModelSerializer):
+    store_name = serializers.CharField(source="vendor.store_name", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    brand_name = serializers.CharField(source="brand.name", read_only=True)
+
+    class Meta:
+        model = VendorProductRequest
+        fields = [
+            "id", "vendor", "store_name", "product_name", "category", "category_name",
+            "brand", "brand_name", "description", "image", "status", "admin_notes",
+            "created_master_product", "created_at", "updated_at"
+        ]
+        read_only_fields = ["id", "vendor", "status", "admin_notes", "created_master_product", "created_at", "updated_at"]

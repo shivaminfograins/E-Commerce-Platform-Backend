@@ -13,6 +13,8 @@ from apps.products.models import Product, Category, ProductVariant
 from apps.orders.models import Order, OrderItem
 from apps.orders.serializers import OrderSummarySerializer
 from .permissions import AdminPermission
+from apps.vendors.models import VendorProductRequest
+from apps.vendors.serializers import VendorProductRequestSerializer
 
 
 class AdminLoginView(TokenObtainPairView):
@@ -447,20 +449,138 @@ class AdminProductViewSet(viewsets.ModelViewSet):
     permission_classes = [AdminPermission]
     pagination_class = ProductPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ["category", "is_active"]
+    filterset_fields = ["category", "is_active", "brand"]
     search_fields = ["name", "description"]
     ordering_fields = ["name", "created_at"]
 
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        if isinstance(response.data, dict) and "results" in response.data:
+            from apps.vendors.models import VendorProduct, VendorProductRequest, VendorProductVariant
+            from apps.products.models import Product
+            
+            product_ids = [item["id"] for item in response.data["results"]]
+            products_map = {p.id: p for p in Product.objects.filter(id__in=product_ids).select_related("category", "brand").prefetch_related("variants__images")}
+            
+            for item in response.data["results"]:
+                p_id = item["id"]
+                p = products_map.get(p_id)
+                item["category_name"] = p.category.name if (p and p.category) else ""
+                item["brand_name"] = p.brand.name if (p and p.brand) else ""
+                
+                thumb = None
+                if p:
+                    for var in p.variants.all():
+                        for img in var.images.all():
+                            if img.image:
+                                thumb = request.build_absolute_uri(img.image.url) if hasattr(img.image, 'url') else str(img.image)
+                                break
+                        if thumb:
+                            break
+                item["thumbnail"] = thumb
+                
+                v_qs = VendorProduct.objects.filter(product_id=p_id)
+                item["vendor_count"] = v_qs.values("vendor").distinct().count()
+                item["listings_count"] = v_qs.count()
+                item["active_vendor_count"] = v_qs.filter(status="ACTIVE").count()
+                item["variant_count"] = VendorProductVariant.objects.filter(vendor_product__product_id=p_id).count()
+
+        return response
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        from apps.vendors.models import VendorProduct, VendorProductRequest
+        if VendorProduct.objects.filter(product=instance).exists():
+            return Response(
+                {
+                    "detail": f"Cannot delete master product '{instance.name}' because it has historical vendor listings, order records, or inventory history. Consider deactivating the product instead.",
+                    "can_deactivate": True
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except Exception:
+            return Response(
+                {
+                    "detail": f"Cannot delete master product '{instance.name}' due to historical record protection. Consider deactivating the product instead.",
+                    "can_deactivate": True
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     @action(detail=True, methods=["patch"], url_path="toggle-status")
     def toggle_status(self, request, pk=None):
-        """
-        Toggles the active status of a product.
-        """
         product = self.get_object()
         product.is_active = not product.is_active
         product.save()
         serializer = self.get_serializer(product)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch"], url_path="activate")
+    def activate(self, request, pk=None):
+        product = self.get_object()
+        product.is_active = True
+        product.save()
+        return Response({"detail": f"Master product '{product.name}' activated successfully.", "is_active": True}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["patch"], url_path="deactivate")
+    def deactivate(self, request, pk=None):
+        product = self.get_object()
+        product.is_active = False
+        product.save()
+        return Response({"detail": f"Master product '{product.name}' deactivated successfully. Associated vendor offers are now frozen.", "is_active": False}, status=status.HTTP_200_OK)
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        data = serializer.data
+
+        # Enrich admin product detail with vendor listings & variant breakdown
+        from apps.vendors.models import VendorProduct, VendorProductRequest
+        vendor_listings = VendorProduct.objects.filter(product=instance).select_related("vendor").prefetch_related("vendor_variants")
+
+        vendors_data = []
+        active_vendor_count = 0
+
+        for vp in vendor_listings:
+            if vp.status == "ACTIVE":
+                active_vendor_count += 1
+
+            var_list = []
+            for vpv in vp.vendor_variants.all():
+                eff_status = "ACTIVE" if (vpv.is_active and vp.status == "ACTIVE" and instance.is_active) else ("FROZEN" if not instance.is_active else "INACTIVE")
+                var_list.append({
+                    "id": vpv.id,
+                    "variant_name": vpv.display_name,
+                    "attributes": vpv.attributes,
+                    "vendor_sku": vpv.vendor_sku,
+                    "price": str(vpv.price),
+                    "stock": vpv.stock,
+                    "is_active": vpv.is_active,
+                    "effective_status": eff_status
+                })
+
+            vendors_data.append({
+                "vendor_id": vp.vendor.id,
+                "store_name": vp.vendor.store_name or vp.vendor.business_name,
+                "business_name": vp.vendor.business_name,
+                "listing_id": vp.id,
+                "listing_status": vp.status,
+                "effective_status": "ACTIVE" if (vp.status == "ACTIVE" and instance.is_active) else ("FROZEN" if not instance.is_active else vp.status),
+                "variant_count": len(var_list),
+                "variants": var_list
+            })
+
+        data["vendor_summary"] = {
+            "total_vendors": len(vendor_listings),
+            "active_vendors": active_vendor_count,
+            "total_listings": len(vendor_listings),
+            "active_listings": active_vendor_count,
+            "total_variants": sum(v["variant_count"] for v in vendors_data),
+        }
+        data["vendors"] = vendors_data
+        return Response(data)
 
 
 class AdminProductVariantViewSet(viewsets.ModelViewSet):
@@ -1045,3 +1165,71 @@ class AdminSettingsView(APIView):
 
 
 
+
+
+class AdminVendorProductRequestViewSet(viewsets.ModelViewSet):
+    permission_classes = [AdminPermission]
+    serializer_class = VendorProductRequestSerializer
+    queryset = VendorProductRequest.objects.all().order_by("-created_at")
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["status", "category", "brand"]
+    search_fields = ["product_name", "description", "vendor__store_name"]
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve(self, request, pk=None):
+        req = self.get_object()
+        if req.status == "APPROVED" and req.created_master_product:
+            return Response(
+                {
+                    "detail": "Request already approved.",
+                    "master_product_id": req.created_master_product.id
+                },
+                status=status.HTTP_200_OK
+            )
+
+        # Generate slug
+        slug = req.product_name.lower().strip().replace(" ", "-")
+        # Ensure unique slug
+        base_slug = slug
+        counter = 1
+        while Product.objects.filter(slug=slug).exists():
+            slug = f"{base_slug}-{counter}"
+            counter += 1
+
+        master_product = Product.objects.create(
+            name=req.product_name,
+            slug=slug,
+            category=req.category,
+            brand=req.brand,
+            description=req.description,
+            is_active=True
+        )
+
+        req.status = "APPROVED"
+        req.created_master_product = master_product
+        req.admin_notes = request.data.get("admin_notes", "Approved by Admin")
+        req.save()
+
+        return Response(
+            {
+                "detail": f"Master product '{master_product.name}' created and request approved successfully.",
+                "master_product_id": master_product.id,
+                "status": "APPROVED"
+            },
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=True, methods=["post"], url_path="reject")
+    def reject(self, request, pk=None):
+        req = self.get_object()
+        req.status = "REJECTED"
+        req.admin_notes = request.data.get("admin_notes", "Rejected by Admin")
+        req.save()
+
+        return Response(
+            {
+                "detail": "Vendor product request rejected.",
+                "status": "REJECTED"
+            },
+            status=status.HTTP_200_OK
+        )

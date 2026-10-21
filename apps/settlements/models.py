@@ -222,6 +222,8 @@ class VendorSettlementItem(models.Model):
 
     gross_amount = models.DecimalField(max_digits=12, decimal_places=2)
     discount_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    platform_discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    vendor_discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     commission_amount = models.DecimalField(max_digits=12, decimal_places=2)
     net_payable = models.DecimalField(max_digits=12, decimal_places=2)
 

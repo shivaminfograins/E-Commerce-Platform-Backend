@@ -27,6 +27,29 @@ class Coupon(models.Model):
         (SCOPE_PRODUCT_COMBINATION, 'Product Combination'),
     ]
 
+    FUNDING_PLATFORM = 'PLATFORM_FUNDED'
+    FUNDING_VENDOR = 'VENDOR_FUNDED'
+
+    FUNDING_TYPE_CHOICES = [
+        (FUNDING_PLATFORM, 'Platform Funded'),
+        (FUNDING_VENDOR, 'Vendor Funded'),
+    ]
+
+    vendor = models.ForeignKey(
+        "vendors.Vendor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="coupons",
+        help_text="The Vendor owner of this coupon. NULL indicates a Platform/Admin-owned coupon."
+    )
+    funding_type = models.CharField(
+        max_length=20,
+        choices=FUNDING_TYPE_CHOICES,
+        default=FUNDING_PLATFORM,
+        help_text="Specifies who absorbs the cost of this coupon discount."
+    )
+
     code = models.CharField(
         max_length=50, 
         unique=True, 
@@ -160,10 +183,24 @@ class Coupon(models.Model):
         if self.discount_type != self.DISCOUNT_FREE_SHIPPING and self.discount_value <= Decimal("0.00"):
             raise ValidationError({"discount_value": "Discount value must be greater than zero."})
 
+        # Vendor ownership & funding validation
+        if self.vendor_id:
+            if self.funding_type != self.FUNDING_VENDOR:
+                raise ValidationError({"funding_type": "Vendor-owned coupons must be VENDOR_FUNDED."})
+        else:
+            if self.funding_type == self.FUNDING_VENDOR:
+                raise ValidationError({"funding_type": "Platform-owned coupons cannot be VENDOR_FUNDED."})
+
+    def delete(self, *args, **kwargs):
+        if self.usages.exists() or self.orders.exists():
+            raise ValidationError("Cannot physically delete a coupon that has been used in orders. Deactivate it instead to preserve audit history.")
+        super().delete(*args, **kwargs)
+
     def save(self, *args, **kwargs):
         self.code = self.code.upper().strip()
         self.full_clean()
         super().save(*args, **kwargs)
+
 
     def is_valid_now(self):
         now = timezone.now()

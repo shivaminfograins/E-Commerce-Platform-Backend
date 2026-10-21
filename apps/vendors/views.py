@@ -13,13 +13,17 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError, PermissionDenied
 
 from apps.admin_panel.permissions import AdminPermission
-from .models import Vendor, VendorAddress, VendorDocument, VendorBankAccount
+from .models import Vendor, VendorAddress, VendorDocument, VendorBankAccount, VendorProductVariant, VendorProductVariantImage, VendorProductRequest
 from .serializers import (
     VendorSerializer,
     VendorAddressSerializer,
     VendorBankAccountSerializer,
     VendorDocumentSerializer,
-    VendorStoreProfileUpdateSerializer
+    VendorStoreProfileUpdateSerializer,
+    VendorProductSerializer,
+    VendorProductVariantSerializer,
+    VendorProductVariantImageSerializer,
+    VendorProductRequestSerializer
 )
 from .permissions import IsVendor, IsApprovedVendor
 
@@ -153,14 +157,151 @@ class VendorDashboardView(APIView):
     permission_classes = [IsAuthenticated, IsApprovedVendor]
 
     def get(self, request):
+        from decimal import Decimal
+        from django.db.models import Count, Sum, Q
+        from apps.orders.models import VendorOrder
+        from apps.settlements.models import VendorSettlement
+        from .models import VendorProduct
+
         vendor = request.user.vendor_profile
+
+        # 1. Product KPI
+        products_count = VendorProduct.objects.filter(vendor=vendor).count()
+
+        # 2. Vendor Order stats (single aggregated query)
+        order_aggregates = VendorOrder.objects.filter(vendor=vendor).aggregate(
+            total_orders=Count("id"),
+            pending=Count("id", filter=Q(status=VendorOrder.PENDING)),
+            confirmed=Count("id", filter=Q(status=VendorOrder.CONFIRMED)),
+            processing=Count("id", filter=Q(status=VendorOrder.PROCESSING)),
+            packed=Count("id", filter=Q(status=VendorOrder.PACKED)),
+            shipped=Count("id", filter=Q(status=VendorOrder.SHIPPED)),
+            delivered=Count("id", filter=Q(status=VendorOrder.DELIVERED)),
+        )
+
+        orders_count = order_aggregates["total_orders"] or 0
+        action_required_count = (
+            (order_aggregates["confirmed"] or 0)
+            + (order_aggregates["processing"] or 0)
+            + (order_aggregates["packed"] or 0)
+        )
+
+        # 3. Inventory Overview
+        vendor_products = VendorProduct.objects.filter(vendor=vendor).prefetch_related("vendor_variants")
+        total_skus = 0
+        in_stock = 0
+        low_stock = 0
+        out_of_stock = 0
+
+        for vp in vendor_products:
+            variants = list(vp.vendor_variants.all())
+            if variants:
+                for v in variants:
+                    total_skus += 1
+                    stk = v.stock or 0
+                    if stk == 0:
+                        out_of_stock += 1
+                    elif stk <= 10:
+                        low_stock += 1
+                    else:
+                        in_stock += 1
+            else:
+                total_skus += 1
+                stk = vp.stock or 0
+                if stk == 0:
+                    out_of_stock += 1
+                elif stk <= 10:
+                    low_stock += 1
+                else:
+                    in_stock += 1
+
+        # 4. Actionable Orders Queue (up to 5 oldest)
+        action_orders_qs = VendorOrder.objects.filter(
+            vendor=vendor,
+            status__in=[VendorOrder.CONFIRMED, VendorOrder.PROCESSING, VendorOrder.PACKED]
+        ).order_by("created_at")[:5]
+
+        action_orders_list = [
+            {
+                "id": vo.id,
+                "vendor_order_number": vo.vendor_order_number,
+                "status": vo.status,
+                "total_amount": "{:.2f}".format(vo.total_amount),
+                "created_at": vo.created_at.isoformat() if vo.created_at else None,
+            }
+            for vo in action_orders_qs
+        ]
+
+        # 5. Financial / Settlement Summary
+        settlements = VendorSettlement.objects.filter(vendor=vendor)
+
+        settled_val = settlements.filter(status=VendorSettlement.SETTLED).aggregate(
+            total=Sum("net_payable")
+        )["total"] or Decimal("0.00")
+
+        pending_payout_val = settlements.filter(
+            status__in=[VendorSettlement.DRAFT, VendorSettlement.PENDING_APPROVAL, VendorSettlement.APPROVED],
+            payout_status__in=[
+                VendorSettlement.PAYOUT_UNPAID,
+                VendorSettlement.PAYOUT_QUEUED,
+                VendorSettlement.PAYOUT_PROCESSING,
+            ]
+        ).aggregate(total=Sum("net_payable"))["total"] or Decimal("0.00")
+
+        commission_val = settlements.filter(status=VendorSettlement.SETTLED).aggregate(
+            total=Sum("commission_amount")
+        )["total"] or Decimal("0.00")
+
+        settlement_gross = settlements.exclude(status=VendorSettlement.CANCELLED).aggregate(
+            total=Sum("gross_amount")
+        )["total"] or Decimal("0.00")
+
+        unsettled_delivered_gross = VendorOrder.objects.filter(
+            vendor=vendor,
+            status=VendorOrder.DELIVERED,
+            settlement_item__isnull=True
+        ).aggregate(total=Sum("subtotal"))["total"] or Decimal("0.00")
+
+        total_sales_val = settlement_gross + unsettled_delivered_gross
+
         data = {
             "store_name": vendor.store_name,
             "business_name": vendor.business_name,
             "status": vendor.status,
-            "commission_rate": "{:.2f}".format(vendor.commission_rate),
-            "created_at": vendor.created_at,
+            "commission_rate": "{:.2f}".format(vendor.commission_rate) if vendor.commission_rate is not None else "0.00",
+            "store": {
+                "name": vendor.store_name,
+                "status": vendor.status,
+            },
+            "kpis": {
+                "products": products_count,
+                "orders": orders_count,
+                "action_required": action_required_count,
+                "net_earnings": "{:.2f}".format(settled_val),
+            },
+            "orders": {
+                "pending": order_aggregates["pending"] or 0,
+                "confirmed": order_aggregates["confirmed"] or 0,
+                "processing": order_aggregates["processing"] or 0,
+                "packed": order_aggregates["packed"] or 0,
+                "shipped": order_aggregates["shipped"] or 0,
+                "delivered": order_aggregates["delivered"] or 0,
+            },
+            "inventory": {
+                "total_skus": total_skus,
+                "in_stock": in_stock,
+                "low_stock": low_stock,
+                "out_of_stock": out_of_stock,
+            },
+            "action_orders": action_orders_list,
+            "settlement": {
+                "total_sales": "{:.2f}".format(total_sales_val),
+                "commission": "{:.2f}".format(commission_val),
+                "settled": "{:.2f}".format(settled_val),
+                "pending_payout": "{:.2f}".format(pending_payout_val),
+            },
         }
+
         return Response(data)
 
 
@@ -392,7 +533,7 @@ from .models import VendorProduct, VendorProductVariant
 from .serializers import (
     VendorCatalogProductSerializer,
     VendorProductSerializer,
-    VendorProductVariantSerializer
+    VendorProductVariantSerializer, VendorProductVariantImage, VendorProductRequestSerializer
 )
 
 class VendorCatalogProductListView(generics.ListAPIView):
@@ -416,10 +557,17 @@ class VendorCatalogProductDetailView(generics.RetrieveAPIView):
 class VendorProductViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsApprovedVendor]
     serializer_class = VendorProductSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["status"]
+    search_fields = ["product__name", "product__description", "product__category__name"]
+    ordering_fields = ["created_at", "updated_at", "price", "stock"]
+    ordering = ["-created_at"]
 
     def get_queryset(self):
         # Strict ownership protection
-        return VendorProduct.objects.filter(vendor=self.request.user.vendor_profile).order_by("-created_at")
+        return VendorProduct.objects.filter(vendor=self.request.user.vendor_profile).prefetch_related(
+            "vendor_variants", "vendor_variants__product_variant"
+        ).select_related("product", "product__category", "product__brand").order_by("-created_at")
 
     def perform_create(self, serializer):
         serializer.save(vendor=self.request.user.vendor_profile)
@@ -438,7 +586,7 @@ class VendorProductViewSet(viewsets.ModelViewSet):
 
 class VendorProductVariantDeleteView(generics.DestroyAPIView):
     permission_classes = [IsAuthenticated, IsApprovedVendor]
-    serializer_class = VendorProductVariantSerializer
+    serializer_class = VendorProductVariantSerializer, VendorProductVariantImage, VendorProductRequestSerializer
 
     def get_queryset(self):
         # Strict ownership protection: must belong to the requesting vendor's products
@@ -547,3 +695,31 @@ class VendorVariantInventoryMovementView(APIView):
             raise ValidationError(e.message_dict if hasattr(e, "message_dict") else str(e))
 
 
+
+
+class VendorProductVariantImageCreateView(generics.CreateAPIView):
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+    serializer_class = VendorProductVariantImageSerializer
+
+    def perform_create(self, serializer):
+        variant_id = self.kwargs.get("variant_id")
+        variant = get_object_or_404(VendorProductVariant, pk=variant_id, vendor_product__vendor=self.request.user.vendor_profile)
+        serializer.save(vendor_variant=variant)
+
+class VendorProductVariantImageDeleteView(generics.DestroyAPIView):
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+    serializer_class = VendorProductVariantImageSerializer
+
+    def get_queryset(self):
+        return VendorProductVariantImage.objects.filter(vendor_variant__vendor_product__vendor=self.request.user.vendor_profile)
+
+
+class VendorProductRequestViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+    serializer_class = VendorProductRequestSerializer
+
+    def get_queryset(self):
+        return VendorProductRequest.objects.filter(vendor=self.request.user.vendor_profile)
+
+    def perform_create(self, serializer):
+        serializer.save(vendor=self.request.user.vendor_profile)

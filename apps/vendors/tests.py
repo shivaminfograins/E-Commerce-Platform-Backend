@@ -1638,3 +1638,112 @@ class VendorProductSerializerInventoryLedgerTests(APITestCase):
 
 
 
+
+
+from rest_framework.test import APITestCase
+
+class VendorProductsManagementAPITests(APITestCase):
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        from apps.vendors.models import Vendor, VendorProduct, VendorProductVariant, VendorInventoryMovement
+        from apps.products.models import Category, Product, ProductVariant
+
+        User = get_user_model()
+        self.user_a = User.objects.create_user(username="vendor_a", email="vendor_a@example.com", password="password123", role="vendor")
+        self.vendor_a = Vendor.objects.create(user=self.user_a, business_name="Vendor A Store", store_name="Vendor A", business_email="vendor_a@example.com", business_phone="1111111111", status="APPROVED")
+
+        self.user_b = User.objects.create_user(username="vendor_b", email="vendor_b@example.com", password="password123", role="vendor")
+        self.vendor_b = Vendor.objects.create(user=self.user_b, business_name="Vendor B Store", store_name="Vendor B", business_email="vendor_b@example.com", business_phone="2222222222", status="APPROVED")
+
+        self.category = Category.objects.create(name="Electronics", slug="electronics")
+        
+        # Simple product (no master variants)
+        self.simple_product = Product.objects.create(category=self.category, name="Wireless Mouse", slug="wireless-mouse", description="Optical mouse")
+        
+        # Variant product (with master variants)
+        self.variant_product = Product.objects.create(category=self.category, name="Mechanical Keyboard", slug="mech-keyboard", description="RGB Keyboard")
+        self.var_red = ProductVariant.objects.create(product=self.variant_product, name="Red Switch", sku="KB-RED", price=50.0, stock=100)
+        self.var_blue = ProductVariant.objects.create(product=self.variant_product, name="Blue Switch", sku="KB-BLUE", price=55.0, stock=100)
+
+        # Existing listings
+        self.vp_a = VendorProduct.objects.create(vendor=self.vendor_a, product=self.simple_product, price=25.00, stock=30, status="ACTIVE")
+        self.vp_b = VendorProduct.objects.create(vendor=self.vendor_b, product=self.simple_product, price=29.00, stock=10, status="ACTIVE")
+
+    def test_vendor_list_own_products_only(self):
+        from django.urls import reverse
+        self.client.force_authenticate(user=self.user_a)
+        url = reverse("vendor-product-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        results = response.data if isinstance(response.data, list) else response.data.get("results", [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], self.vp_a.id)
+
+    def test_vendor_list_search_and_filter(self):
+        from django.urls import reverse
+        self.client.force_authenticate(user=self.user_a)
+        url = reverse("vendor-product-list") + "?search=Wireless"
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        results = response.data if isinstance(response.data, list) else response.data.get("results", [])
+        self.assertEqual(len(results), 1)
+
+        url_no_match = reverse("vendor-product-list") + "?search=NonExistentProduct"
+        resp_no_match = self.client.get(url_no_match)
+        self.assertEqual(resp_no_match.status_code, 200)
+        results_no_match = resp_no_match.data if isinstance(resp_no_match.data, list) else resp_no_match.data.get("results", [])
+        self.assertEqual(len(results_no_match), 0)
+
+    def test_vendor_cannot_get_or_update_other_vendor_product(self):
+        from django.urls import reverse
+        self.client.force_authenticate(user=self.user_a)
+        url = reverse("vendor-product-detail", kwargs={"pk": self.vp_b.id})
+        
+        # GET returns 404
+        response_get = self.client.get(url)
+        self.assertEqual(response_get.status_code, 404)
+
+        # PATCH returns 404
+        response_patch = self.client.patch(url, {"price": 10.00}, format="json")
+        self.assertEqual(response_patch.status_code, 404)
+
+    def test_simple_product_stock_adjustment_via_ledger(self):
+        from django.urls import reverse
+        from apps.vendors.models import VendorInventoryMovement
+        self.client.force_authenticate(user=self.user_a)
+        url = reverse("vendor-product-detail", kwargs={"pk": self.vp_a.id})
+        
+        # Increase stock from 30 to 45
+        response = self.client.patch(url, {"stock": 45}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.vp_a.refresh_from_db()
+        self.assertEqual(self.vp_a.stock, 45)
+
+        movements = VendorInventoryMovement.objects.filter(vendor_product=self.vp_a)
+        self.assertEqual(movements.count(), 1)
+        m = movements.first()
+        self.assertEqual(m.movement_type, "ADJUSTMENT")
+        self.assertEqual(m.quantity, 15)
+        self.assertEqual(m.previous_stock, 30)
+        self.assertEqual(m.new_stock, 45)
+
+    def test_cannot_delete_listing_with_inventory_movements(self):
+        from django.urls import reverse
+        from apps.vendors.models import VendorInventoryMovement
+        # Record a movement for vp_a
+        VendorInventoryMovement.objects.create(
+            vendor=self.vendor_a,
+            vendor_product=self.vp_a,
+            product_name_snapshot="Wireless Mouse",
+            movement_type="IN",
+            quantity=30,
+            previous_stock=0,
+            new_stock=30,
+            reason="INITIAL_STOCK",
+            created_by=self.user_a
+        )
+
+        self.client.force_authenticate(user=self.user_a)
+        url = reverse("vendor-product-detail", kwargs={"pk": self.vp_a.id})
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 400)

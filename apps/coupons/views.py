@@ -9,9 +9,10 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 
 from apps.admin_panel.permissions import AdminPermission
+from apps.vendors.permissions import IsApprovedVendor
 from apps.cart.models import CartItem
 from .models import Coupon, CouponUsage
-from .serializers import CouponSerializer, CouponValidateSerializer
+from .serializers import CouponSerializer, VendorCouponSerializer, CouponValidateSerializer
 
 from django.core.exceptions import ValidationError
 from .services import CouponValidationService
@@ -45,7 +46,7 @@ class AdminCouponViewSet(viewsets.ModelViewSet):
     serializer_class = CouponSerializer
     permission_classes = [AdminPermission]
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ["is_active", "discount_type"]
+    filterset_fields = ["is_active", "discount_type", "funding_type", "vendor"]
     search_fields = ["code", "description"]
     ordering_fields = ["code", "created_at", "end_date"]
 
@@ -70,6 +71,67 @@ class AdminCouponViewSet(viewsets.ModelViewSet):
         coupon.save()
         serializer = self.get_serializer(coupon)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class VendorCouponViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for approved vendors to manage their store coupons.
+    Strict multi-tenant isolation: Vendors can only access coupon.vendor == request.user.vendor_profile.
+    """
+    serializer_class = VendorCouponSerializer
+    permission_classes = [IsAuthenticated, IsApprovedVendor]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["is_active", "discount_type"]
+    search_fields = ["code", "description"]
+    ordering_fields = ["code", "created_at", "end_date"]
+
+    def get_queryset(self):
+        if not hasattr(self.request.user, "vendor_profile"):
+            return Coupon.objects.none()
+        vendor = self.request.user.vendor_profile
+        queryset = Coupon.objects.filter(vendor=vendor).order_by("-created_at")
+        is_expired = self.request.query_params.get("is_expired")
+        if is_expired is not None:
+            now = timezone.now()
+            if is_expired.lower() == "true":
+                queryset = queryset.filter(end_date__lt=now)
+            elif is_expired.lower() == "false":
+                queryset = queryset.filter(end_date__gte=now)
+        return queryset
+
+    def perform_destroy(self, instance):
+        if instance.usages.exists() or instance.orders.exists():
+            raise serializers.ValidationError("Cannot physically delete a coupon that has been used in orders. Deactivate it instead to preserve audit history.")
+        instance.delete()
+
+    @action(detail=True, methods=["patch"], url_path="toggle-status")
+    def toggle_status(self, request, pk=None):
+        coupon = self.get_object()
+        coupon.is_active = not coupon.is_active
+        coupon.save()
+        serializer = self.get_serializer(coupon)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="usage")
+    def usage(self, request, pk=None):
+        coupon = self.get_object()
+        usages = coupon.usages.select_related("user", "order").order_by("-used_at")
+        usage_data = [
+            {
+                "id": u.id,
+                "user_id": u.user_id,
+                "username": u.user.username,
+                "order_number": u.order.order_number if u.order else None,
+                "used_at": u.used_at,
+            }
+            for u in usages
+        ]
+        return Response({
+            "coupon_code": coupon.code,
+            "usage_count": coupon.usage_count,
+            "usage_limit": coupon.usage_limit,
+            "usages": usage_data
+        }, status=status.HTTP_200_OK)
 
 
 class CouponValidateView(APIView):

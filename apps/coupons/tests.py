@@ -426,3 +426,173 @@ class CouponEngineNewFeaturesTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(float(response.data["discount_amount"]), 99.0) # shipping charge is 99
 
+
+class VendorCouponTests(APITestCase):
+    def setUp(self):
+        self.now = timezone.now()
+        self.user_vendor_a = User.objects.create_user(
+            username="vendor_a_user", email="vendora@example.com", password="Password123", role="vendor"
+        )
+        from apps.vendors.models import Vendor
+        self.vendor_a = Vendor.objects.create(
+            user=self.user_vendor_a, store_name="Vendor A Store", business_name="Vendor A LLC", business_email="vendora@example.com", status="APPROVED", commission_rate=Decimal("10.00")
+        )
+
+        self.user_vendor_b = User.objects.create_user(
+            username="vendor_b_user", email="vendorb@example.com", password="Password123", role="vendor"
+        )
+        self.vendor_b = Vendor.objects.create(
+            user=self.user_vendor_b, store_name="Vendor B Store", business_name="Vendor B LLC", business_email="vendorb@example.com", status="APPROVED", commission_rate=Decimal("15.00")
+        )
+
+        self.customer = User.objects.create_user(
+            username="customer_user", email="cust@example.com", password="Password123", role="customer"
+        )
+
+        self.category = Category.objects.create(name="Tech", slug="tech")
+        self.product_a = Product.objects.create(name="Gadget A", slug="gadget-a", category=self.category)
+        self.variant_a = ProductVariant.objects.create(product=self.product_a, name="Std A", sku="SKU-A", price=Decimal("1000.00"))
+        
+        self.product_b = Product.objects.create(name="Gadget B", slug="gadget-b", category=self.category)
+        self.variant_b = ProductVariant.objects.create(product=self.product_b, name="Std B", sku="SKU-B", price=Decimal("500.00"))
+
+        from apps.vendors.models import VendorProduct, VendorProductVariant
+        self.vp_a = VendorProduct.objects.create(vendor=self.vendor_a, product=self.product_a, price=Decimal("1000.00"), status="ACTIVE")
+        self.vpv_a = VendorProductVariant.objects.create(vendor_product=self.vp_a, product_variant=self.variant_a, price=Decimal("1000.00"), stock=100, is_active=True)
+
+        self.vp_b = VendorProduct.objects.create(vendor=self.vendor_b, product=self.product_b, price=Decimal("500.00"), status="ACTIVE")
+        self.vpv_b = VendorProductVariant.objects.create(vendor_product=self.vp_b, product_variant=self.variant_b, price=Decimal("500.00"), stock=100, is_active=True)
+
+    def test_vendor_create_coupon(self):
+        """Vendor can create a coupon via vendor API which is automatically VENDOR_FUNDED and bound to vendor."""
+        self.client.force_authenticate(user=self.user_vendor_a)
+        url = reverse("vendor-coupons-list")
+        payload = {
+            "code": "VENDOR100",
+            "description": "Vendor A 100 Off",
+            "discount_type": "fixed",
+            "discount_value": "100.00",
+            "min_purchase_amount": "500.00",
+            "start_date": (self.now - timedelta(days=1)).isoformat(),
+            "end_date": (self.now + timedelta(days=10)).isoformat(),
+            "is_active": True
+        }
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["funding_type"], "VENDOR_FUNDED")
+        self.assertEqual(response.data["vendor_name"], "Vendor A Store")
+
+    def test_vendor_tenant_isolation(self):
+        """Vendor B cannot view or modify Vendor A's coupon."""
+        coupon_a = Coupon.objects.create(
+            code="VENDORA50",
+            discount_type="fixed",
+            discount_value=Decimal("50.00"),
+            vendor=self.vendor_a,
+            funding_type=Coupon.FUNDING_VENDOR,
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=10),
+            is_active=True
+        )
+        self.client.force_authenticate(user=self.user_vendor_b)
+        url = reverse("vendor-coupons-detail", kwargs={"pk": coupon_a.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_mixed_vendor_cart_coupon_allocation(self):
+        """Vendor A coupon applied on mixed-vendor cart allocates 100% discount to Vendor A and $0 to Vendor B."""
+        coupon_a = Coupon.objects.create(
+            code="VENDORA100",
+            discount_type="fixed",
+            discount_value=Decimal("100.00"),
+            vendor=self.vendor_a,
+            funding_type=Coupon.FUNDING_VENDOR,
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=10),
+            is_active=True
+        )
+
+        self.client.force_authenticate(user=self.customer)
+        CartItem.objects.create(
+            user=self.customer, vendor_product=self.vp_a, vendor_product_variant=self.vpv_a, variant=self.variant_a, quantity=1
+        )
+        CartItem.objects.create(
+            user=self.customer, vendor_product=self.vp_b, vendor_product_variant=self.vpv_b, variant=self.variant_b, quantity=1
+        )
+
+        from apps.orders.models import Order
+        from apps.orders.services import create_split_vendor_orders
+        master_order = Order.objects.create(
+            user=self.customer,
+            subtotal=Decimal("1500.00"),
+            discount=Decimal("100.00"),
+            total_amount=Decimal("1400.00"),
+            coupon=coupon_a,
+            coupon_code=coupon_a.code
+        )
+
+        cart_items = list(CartItem.objects.filter(user=self.customer))
+        create_split_vendor_orders(master_order, cart_items, self.customer)
+
+        from apps.orders.models import VendorOrder
+        v_order_a = VendorOrder.objects.get(master_order=master_order, vendor=self.vendor_a)
+        v_order_b = VendorOrder.objects.get(master_order=master_order, vendor=self.vendor_b)
+
+        self.assertEqual(v_order_a.subtotal, Decimal("1000.00"))
+        self.assertEqual(v_order_a.discount, Decimal("100.00"))
+        self.assertEqual(v_order_a.vendor_discount_amount, Decimal("100.00"))
+        self.assertEqual(v_order_a.platform_discount_amount, Decimal("0.00"))
+        self.assertEqual(v_order_a.discount_funding_type, "VENDOR_FUNDED")
+
+        self.assertEqual(v_order_b.subtotal, Decimal("500.00"))
+        self.assertEqual(v_order_b.discount, Decimal("0.00"))
+        self.assertEqual(v_order_b.vendor_discount_amount, Decimal("0.00"))
+        self.assertEqual(v_order_b.platform_discount_amount, Decimal("0.00"))
+        self.assertEqual(v_order_b.discount_funding_type, "NONE")
+
+        # Now verify settlement generation for Vendor A
+        from apps.settlements.services import generate_vendor_settlements
+        from apps.orders.models import VendorOrder, Order
+        master_order.payment_status = Order.PAYMENT_PAID
+        master_order.save()
+        v_order_a.status = VendorOrder.DELIVERED
+        v_order_a.delivered_at = self.now - timedelta(days=10)
+        v_order_a.save()
+
+        today = self.now.date()
+        settlement_a = generate_vendor_settlements(
+            vendor=self.vendor_a,
+            period_start=today - timedelta(days=30),
+            period_end=today + timedelta(days=1),
+            user=self.user_vendor_a
+        )
+        self.assertIsNotNone(settlement_a)
+        item_a = settlement_a.items.first()
+        self.assertEqual(item_a.gross_amount, Decimal("1000.00"))
+        self.assertEqual(item_a.vendor_discount_amount, Decimal("100.00"))
+        self.assertEqual(item_a.commission_amount, Decimal("100.00")) # 10% of 1000.00 gross
+        self.assertEqual(item_a.net_payable, Decimal("800.00")) # 1000 - 100(discount) - 100(comm)
+
+    def test_used_coupon_deletion_blocked(self):
+        """Used coupon physical deletion is blocked with ValidationError."""
+        coupon = Coupon.objects.create(
+            code="USED100",
+            discount_type="fixed",
+            discount_value=Decimal("100.00"),
+            start_date=self.now - timedelta(days=1),
+            end_date=self.now + timedelta(days=10),
+            is_active=True
+        )
+        from apps.orders.models import Order
+        order = Order.objects.create(
+            user=self.customer,
+            subtotal=Decimal("500.00"),
+            total_amount=Decimal("400.00")
+        )
+        CouponUsage.objects.create(coupon=coupon, user=self.customer, order=order)
+
+        from django.core.exceptions import ValidationError
+        with self.assertRaises(ValidationError):
+            coupon.delete()
+
+

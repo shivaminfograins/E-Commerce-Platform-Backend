@@ -346,6 +346,35 @@ class Order(models.Model):
         ),
     )
 
+    coupon_owner_vendor = models.ForeignKey(
+        "vendors.Vendor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="funded_master_orders",
+        help_text="Snapshot of the Vendor owner if a vendor coupon was applied."
+    )
+
+    discount_funding_type = models.CharField(
+        max_length=20,
+        default="NONE",
+        help_text="Funding source of discount: PLATFORM_FUNDED, VENDOR_FUNDED, or NONE."
+    )
+
+    platform_discount_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Amount of discount absorbed by the platform."
+    )
+
+    vendor_discount_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Amount of discount absorbed by vendor(s)."
+    )
+
     notes = models.TextField(
         blank=True,
         default="",
@@ -525,6 +554,9 @@ class VendorOrder(models.Model):
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     shipping_charge = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
     discount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    platform_discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    vendor_discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    discount_funding_type = models.CharField(max_length=20, default="NONE")
     tax = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     

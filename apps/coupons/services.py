@@ -4,6 +4,25 @@ from django.core.exceptions import ValidationError
 from apps.orders.models import Order
 from .models import Coupon, CouponUsage, CouponProduct, CouponCategory
 
+
+def _get_item_price(item):
+    if item.vendor_product_variant_id and item.vendor_product_variant:
+        return item.vendor_product_variant.price
+    if item.vendor_product:
+        return item.vendor_product.price
+    if item.variant:
+        return item.variant.price
+    return Decimal("0.00")
+
+
+def _get_item_vendor(item):
+    if item.vendor_product and item.vendor_product.vendor:
+        return item.vendor_product.vendor
+    if item.vendor_product_variant and item.vendor_product_variant.vendor_product:
+        return item.vendor_product_variant.vendor_product.vendor
+    return None
+
+
 class CouponValidationService:
     def _validate_dates(self, coupon):
         if not coupon.is_active:
@@ -28,58 +47,86 @@ class CouponValidationService:
         if coupon.first_order_only:
             if not user or not user.is_authenticated:
                 raise ValidationError("Authentication required for first order coupon.")
-            # Check if user has any completed orders
             has_previous_orders = Order.objects.filter(user=user).exclude(status=Order.CANCELLED).exists()
             if has_previous_orders:
                 raise ValidationError("This coupon is only valid for your first order.")
 
+    def _validate_vendor_ownership(self, coupon, cart_items):
+        if coupon.vendor_id:
+            vendor_items = [item for item in cart_items if _get_item_vendor(item) == coupon.vendor]
+            if not vendor_items:
+                raise ValidationError(f"This coupon is only valid for items sold by store '{coupon.vendor.store_name}'.")
+            return vendor_items
+        return cart_items
+
     def _validate_category(self, coupon, cart_items):
         if coupon.coupon_scope == Coupon.SCOPE_SPECIFIC_CATEGORIES:
             allowed_category_ids = set(coupon.categories.values_list('id', flat=True))
-            cart_category_ids = {item.variant.product.category_id for item in cart_items if item.variant.product and item.variant.product.category_id}
+            cart_category_ids = set()
+            for item in cart_items:
+                prod = item.vendor_product.product if item.vendor_product else (item.variant.product if item.variant else None)
+                if prod and prod.category_id:
+                    cart_category_ids.add(prod.category_id)
             if not allowed_category_ids.intersection(cart_category_ids):
                 raise ValidationError("This coupon is not valid for any categories in your cart.")
 
     def _validate_products(self, coupon, cart_items):
         if coupon.coupon_scope == Coupon.SCOPE_SPECIFIC_PRODUCTS:
             allowed_product_ids = set(coupon.products.values_list('id', flat=True))
-            cart_product_ids = {item.variant.product_id for item in cart_items if item.variant.product_id}
+            cart_product_ids = set()
+            for item in cart_items:
+                prod_id = item.vendor_product.product_id if item.vendor_product else (item.variant.product_id if item.variant else None)
+                if prod_id:
+                    cart_product_ids.add(prod_id)
             if not allowed_product_ids.intersection(cart_product_ids):
                 raise ValidationError("This coupon is not valid for any products in your cart.")
 
     def _validate_product_combination(self, coupon, cart_items):
         if coupon.coupon_scope == Coupon.SCOPE_PRODUCT_COMBINATION:
             coupon_products = CouponProduct.objects.filter(coupon=coupon)
-            cart_product_ids = {item.variant.product_id for item in cart_items if item.variant.product_id}
+            cart_product_ids = set()
+            for item in cart_items:
+                prod_id = item.vendor_product.product_id if item.vendor_product else (item.variant.product_id if item.variant else None)
+                if prod_id:
+                    cart_product_ids.add(prod_id)
             for cp in coupon_products:
                 if cp.product_id not in cart_product_ids:
                     raise ValidationError(f"This coupon requires the combination of specific products: {', '.join([p.name for p in coupon.products.all()])}.")
 
     def _validate_quantity(self, coupon, cart_items):
-        # Validate minimum cart quantity
         if coupon.min_cart_quantity is not None:
             total_qty = sum(item.quantity for item in cart_items)
             if total_qty < coupon.min_cart_quantity:
                 raise ValidationError(f"Minimum cart quantity of {coupon.min_cart_quantity} products required.")
 
-        # Validate minimum product quantity
         if coupon.min_product_quantity is not None:
             if coupon.coupon_scope == Coupon.SCOPE_SPECIFIC_PRODUCTS:
                 target_product_ids = set(coupon.products.values_list('id', flat=True))
-                target_qty = sum(item.quantity for item in cart_items if item.variant.product_id in target_product_ids)
+                target_qty = sum(
+                    item.quantity for item in cart_items 
+                    if (item.vendor_product and item.vendor_product.product_id in target_product_ids) or 
+                       (item.variant and item.variant.product_id in target_product_ids)
+                )
                 if target_qty < coupon.min_product_quantity:
                     raise ValidationError(f"Minimum quantity of {coupon.min_product_quantity} target products required.")
             elif coupon.coupon_scope == Coupon.SCOPE_SPECIFIC_CATEGORIES:
                 target_category_ids = set(coupon.categories.values_list('id', flat=True))
-                target_qty = sum(item.quantity for item in cart_items if item.variant.product.category_id in target_category_ids)
+                target_qty = sum(
+                    item.quantity for item in cart_items 
+                    if (item.vendor_product and item.vendor_product.product and item.vendor_product.product.category_id in target_category_ids) or 
+                       (item.variant and item.variant.product and item.variant.product.category_id in target_category_ids)
+                )
                 if target_qty < coupon.min_product_quantity:
                     raise ValidationError(f"Minimum quantity of {coupon.min_product_quantity} target category products required.")
 
-        # Validate combination quantities
         if coupon.coupon_scope == Coupon.SCOPE_PRODUCT_COMBINATION:
             coupon_products = CouponProduct.objects.filter(coupon=coupon)
             for cp in coupon_products:
-                cart_item = next((item for item in cart_items if item.variant.product_id == cp.product_id), None)
+                cart_item = next((
+                    item for item in cart_items 
+                    if (item.vendor_product and item.vendor_product.product_id == cp.product_id) or 
+                       (item.variant and item.variant.product_id == cp.product_id)
+                ), None)
                 if not cart_item or cart_item.quantity < cp.min_quantity:
                     raise ValidationError(f"Minimum quantity of {cp.min_quantity} required for {cp.product.name}.")
 
@@ -90,8 +137,13 @@ class CouponValidationService:
             raise ValidationError(f"Subtotal exceeds the maximum purchase amount of ₹{coupon.max_purchase_amount} allowed for this coupon.")
 
     def _calculate_discount(self, coupon, cart_items, subtotal):
+        if coupon.vendor_id:
+            cart_items = [item for item in cart_items if _get_item_vendor(item) == coupon.vendor]
+            subtotal = sum(_get_item_price(item) * item.quantity for item in cart_items)
+            if subtotal <= Decimal("0.00"):
+                return Decimal("0.00")
+
         if coupon.discount_type == Coupon.DISCOUNT_FREE_SHIPPING:
-            # Free Shipping saves ₹99 if subtotal is below the free shipping threshold (₹999)
             if subtotal >= Decimal("999.00"):
                 return Decimal("0.00")
             return Decimal("99.00")
@@ -100,24 +152,18 @@ class CouponValidationService:
         if coupon.coupon_scope == Coupon.SCOPE_SPECIFIC_CATEGORIES:
             allowed_category_ids = set(coupon.categories.values_list('id', flat=True))
             qualifying_subtotal = sum(
-                item.variant.price * item.quantity 
+                _get_item_price(item) * item.quantity 
                 for item in cart_items 
-                if item.variant.product.category_id in allowed_category_ids
+                if (item.vendor_product and item.vendor_product.product and item.vendor_product.product.category_id in allowed_category_ids) or
+                   (item.variant and item.variant.product and item.variant.product.category_id in allowed_category_ids)
             )
-        elif coupon.coupon_scope == Coupon.SCOPE_SPECIFIC_PRODUCTS:
+        elif coupon.coupon_scope in (Coupon.SCOPE_SPECIFIC_PRODUCTS, Coupon.SCOPE_PRODUCT_COMBINATION):
             allowed_product_ids = set(coupon.products.values_list('id', flat=True))
             qualifying_subtotal = sum(
-                item.variant.price * item.quantity 
+                _get_item_price(item) * item.quantity 
                 for item in cart_items 
-                if item.variant.product_id in allowed_product_ids
-            )
-        elif coupon.coupon_scope == Coupon.SCOPE_PRODUCT_COMBINATION:
-            # Combination coupon discount applies to the combination products subtotal
-            allowed_product_ids = set(coupon.products.values_list('id', flat=True))
-            qualifying_subtotal = sum(
-                item.variant.price * item.quantity 
-                for item in cart_items 
-                if item.variant.product_id in allowed_product_ids
+                if (item.vendor_product and item.vendor_product.product_id in allowed_product_ids) or
+                   (item.variant and item.variant.product_id in allowed_product_ids)
             )
         else:
             qualifying_subtotal = subtotal
@@ -139,15 +185,16 @@ class CouponValidationService:
         if not cart_items:
             raise ValidationError("Your cart is empty.")
 
-        subtotal = sum(item.variant.price * item.quantity for item in cart_items)
+        eligible_items = self._validate_vendor_ownership(coupon, cart_items)
+        subtotal = sum(_get_item_price(item) * item.quantity for item in eligible_items)
 
-        # Run independent validations
         self._validate_dates(coupon)
         self._validate_usage_limit(coupon)
         self._validate_per_user(coupon, user)
         self._validate_first_order(coupon, user)
-        self._validate_category(coupon, cart_items)
-        self._validate_products(coupon, cart_items)
-        self._validate_product_combination(coupon, cart_items)
-        self._validate_quantity(coupon, cart_items)
+        self._validate_category(coupon, eligible_items)
+        self._validate_products(coupon, eligible_items)
+        self._validate_product_combination(coupon, eligible_items)
+        self._validate_quantity(coupon, eligible_items)
         self._validate_cart_amount(coupon, subtotal)
+

@@ -14,6 +14,7 @@ class CouponProductSerializer(serializers.ModelSerializer):
 
 class CouponSerializer(serializers.ModelSerializer):
     is_expired = serializers.SerializerMethodField()
+    vendor_name = serializers.ReadOnlyField(source='vendor.store_name')
     categories = serializers.PrimaryKeyRelatedField(
         many=True, queryset=Category.objects.all(), required=False
     )
@@ -27,6 +28,9 @@ class CouponSerializer(serializers.ModelSerializer):
             'id',
             'code',
             'description',
+            'vendor',
+            'vendor_name',
+            'funding_type',
             'discount_type',
             'discount_value',
             'min_purchase_amount',
@@ -57,7 +61,6 @@ class CouponSerializer(serializers.ModelSerializer):
         return obj.end_date < timezone.now()
 
     def validate(self, data):
-        # We need a temp dict copy because we pop M2M fields out of standard model init
         temp_data = dict(data)
         temp_data.pop('categories', None)
         temp_data.pop('couponproduct_set', None)
@@ -114,5 +117,42 @@ class CouponSerializer(serializers.ModelSerializer):
         return instance
 
 
+class VendorCouponSerializer(CouponSerializer):
+    vendor = serializers.PrimaryKeyRelatedField(read_only=True)
+    vendor_name = serializers.ReadOnlyField(source='vendor.store_name')
+    funding_type = serializers.CharField(read_only=True)
+
+    def validate(self, data):
+        request = self.context.get("request")
+        if not request or not hasattr(request.user, "vendor_profile"):
+            raise serializers.ValidationError("Vendor profile required.")
+
+        vendor = request.user.vendor_profile
+
+        # Force funding_type to VENDOR_FUNDED and vendor to request vendor profile
+        data["funding_type"] = Coupon.FUNDING_VENDOR
+        data["vendor"] = vendor
+
+        # Validate targeting: if scope is specific_products or product_combination, verify product ownership
+        product_combinations = data.get("couponproduct_set", [])
+
+        allowed_products = set(
+            Product.objects.filter(vendor_listings__vendor=vendor).values_list("id", flat=True)
+        )
+
+        for pc in product_combinations:
+            p_obj = pc.get("product")
+            if p_obj and p_obj.id not in allowed_products:
+                raise serializers.ValidationError(f"Product '{p_obj.name}' does not belong to your store catalog.")
+
+        return super().validate(data)
+
+    def create(self, validated_data):
+        validated_data['vendor'] = self.context['request'].user.vendor_profile
+        validated_data['funding_type'] = Coupon.FUNDING_VENDOR
+        return super().create(validated_data)
+
+
 class CouponValidateSerializer(serializers.Serializer):
     code = serializers.CharField(required=True, max_length=50)
+

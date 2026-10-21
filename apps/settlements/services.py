@@ -49,10 +49,20 @@ def generate_vendor_settlements(vendor, period_start, period_end, user):
         for v_order in eligible_orders:
             gross = v_order.subtotal
             discount = v_order.discount
-            comm_base = max(Decimal("0.00"), gross - discount)
-            
-            comm_amount = (comm_base * (comm_rate / Decimal("100.00"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            net_item = comm_base - comm_amount
+            funding_type = v_order.discount_funding_type
+
+            if funding_type == "VENDOR_FUNDED":
+                vend_discount = v_order.vendor_discount_amount or discount
+                plat_discount = Decimal("0.00")
+                comm_base = gross
+                comm_amount = (comm_base * (comm_rate / Decimal("100.00"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                net_item = gross - vend_discount - comm_amount
+            else:
+                plat_discount = v_order.platform_discount_amount or discount
+                vend_discount = Decimal("0.00")
+                comm_base = max(Decimal("0.00"), gross - plat_discount)
+                comm_amount = (comm_base * (comm_rate / Decimal("100.00"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                net_item = comm_base - comm_amount
 
             item = VendorSettlementItem(
                 settlement=settlement,
@@ -62,6 +72,8 @@ def generate_vendor_settlements(vendor, period_start, period_end, user):
                 vendor_commission_rate_snapshot=comm_rate,
                 gross_amount=gross,
                 discount_amount=discount,
+                platform_discount_amount=plat_discount,
+                vendor_discount_amount=vend_discount,
                 commission_amount=comm_amount,
                 net_payable=net_item
             )

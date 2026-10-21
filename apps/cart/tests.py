@@ -91,3 +91,26 @@ class CartRemediationTests(TestCase):
         self.assertEqual(merge_res.status_code, status.HTTP_200_OK)
         self.assertEqual(merge_res.data["item_count"], 1)
         self.assertEqual(merge_res.data["cart_items"][0]["quantity"], 3)
+
+    def test_cart_addition_with_product_id_and_variant_id(self):
+        self.client.force_authenticate(user=self.user)
+
+        # Test adding simple product using product_id
+        res_prod = self.client.post("/api/cart/", {
+            "product_id": self.simple_product.id,
+            "quantity": 1
+        })
+        self.assertEqual(res_prod.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_prod.data["cart_items"][0]["product_name"], "Simple Cable")
+
+        # Clear cart
+        self.client.delete("/api/cart/clear/")
+
+        # Test adding variant product using master variant_id
+        res_var = self.client.post("/api/cart/", {
+            "variant_id": self.m_variant.id,
+            "quantity": 2
+        })
+        self.assertEqual(res_var.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_var.data["cart_items"][0]["variant_name"], "128GB")
+
